@@ -11,38 +11,52 @@ tools: [ "#codebase", "#terminal" ]
 - 程序的作用之一是验证训练后的模型，做Validation。
 
 # 训练方案架构描述
+## 流程图
 
-【 图像塔 (Vision Tower) 】                              【 文本塔 (Text Tower) 】
- 
- Cam 环视图像 (40帧)                                      场景文本真值描述
-         │                                                (来自 scene.json)
-         ▼                                                       │
-   BEVFormer-v2                                                  ▼
-[40, 40000, 256] 稠密特征 (保持256维省显存)                   DeBERTa-v3-base
-         │                                                       |
-         ▼ 空间 Attention Pooling 压扁                            │
-     [40, 256] 时序骨架                                           ▼
-         │                                              [B, Seq_Len, 768]
-         ▼ Linear 线性层直接升维                                          │
-     [40, 768]                                                   ▼ Masked Mean Pooling
-         │                                                   (过滤 [PAD] 占位符)
-         ▼ 拼入 [CLS] Token & 位置编码                                   │
-     [41, 768]                                                   ▼
-         │                                               [B, 768] 变长句向量
-         ▼ 3层 Lightweight Transformer                           │
-     [41, 768] 会议多层交互                                       ▼ Text Projector
-         │                                              (同维对齐映射层, 参与训练)
-         ▼ 提取第 0 位 [CLS] 向量                                        │
-     [B, 768] 视频全局特征                                        ▼ L2 Normalize
-         │                                               [B, 768] 最终文本向量
-         ▼ L2 Normalize                                          │
-     [B, 768] 最终视觉向量                                        │
-         │                                                       │
-         └───────────────────────► 【矩阵点积】 ◄────────────────┘
-                                  (算余弦相似度)
-                                         │
-                                         ▼
-                               InfoNCE Loss 对比损失
+【 图像塔 (Vision Tower) 】                               【 文本塔 (Text Tower) 】
+
+           Cam 环视图像 (40帧)                                      场景文本真值描述
+                │                                                    (来自 scene.json)
+                ▼                                                           │
+          BEVFormer-v2                                                      ▼
+     [40, 40000, 256] 稠密特征                                       DeBERTa-v3-base
+                │                                                           │
+                ├─◄─── 注入 2D 空间位置编码 (Spatial PE)                     │
+                ▼                                                           ▼
+       空间 Attention Pooling 压扁                                   [B, Seq_Len, 768]
+                │                                                           │
+                ▼                                                           ▼ Masked Mean Pooling
+         [40, 256] 时序骨架                                           (过滤 [PAD] 占位符)
+                │                                                           │
+                ▼ Linear 线性层直接升维                                      ▼
+            [40, 768]                                                [B, 768] 变长句向量
+                │                                                           │
+                ▼ 拼入 [CLS] Token                                         ▼
+            [41, 768]                                                 Text Projector
+                │                                                 (独立对齐映射层, 参与训练)
+                ├─◄─── 注入 1D 时序位置编码 (Temporal PE)                   │
+                ▼                                                           ▼
+     3层 Lightweight Transformer                                       L2 Normalize
+    [41, 768] 帧间/全局多层交互                                              │
+                │                                                           ▼
+                ▼ 提取第 0 位 [CLS] 向量                              [B, 768] 最终文本向量
+            [B, 768]                                                        │
+                │                                                           │
+                ▼ Vision Projector                                          │
+            (独立对齐映射层, 参与训练)                                        │
+                │                                                           │
+                ▼                                                           │
+           L2 Normalize                                                     │
+                │                                                           │
+                ▼                                                           │
+       [B, 768] 最终视觉向量                                                 │
+                │                                                           │
+                └───────────────────────► 【 矩阵点积 】 ◄──────────────────┘
+                                        (计算余弦相似度)
+                                                │
+                                                ▼
+                                        InfoNCE Loss 对比损失
+                                  (支持多卡 DDP Gather 扩大 Batch)
 
 ## 图像塔数据流
 图像塔的目标是将长时序的自动驾驶环视画面，压缩、精炼并升维成一个能够代表整个视频片段全局语义的 [B, 768] 向量。
@@ -55,6 +69,7 @@ tools: [ "#codebase", "#terminal" ]
 - 需要注意的是，在当前配置下，BEVFormer v2被完全冻结权重，仅进行前向传播以提取特征。
 
 3. 空间 Attention Pooling 压扁
+- 在空间池化前注入2D 空间位置编码 (Spatial PE)，确保模型压缩了空间维度后，依然能识别出文本中“左前”、“右后”等关键方位。
 - 为了消除密集的空间维度，引入一个可学习的全局 Query 向量，通过空间自注意力机制（Spatial Attention Pooling），把每帧的 40,000 个点融合、压缩为 1 个点。此时，张量形状“压扁”为 [40, 256]，被称为时序骨架。
 
 4. 线性层直接升维
@@ -64,10 +79,15 @@ tools: [ "#codebase", "#terminal" ]
 - 在 40 个时序 Token 的最前端（第 0 位）拼接一个全零初始化的可学习 [CLS]（分类标记） 向量，序列长度由 40 变成 41，形状变为 [41, 768]。紧接着，为这 41 个位置注入绝对或相对时序位置编码。
 
 6. 时序 Transformer 会议交互
+- 在时序 Transformer 前注入1D 时序位置编码 (Temporal PE)，确保模型能识别“先做什么、后做什么”的动作先后顺序。
 - 将 [41, 768] 的张量送入一个由 3 层组成的轻量级时序 Transformer Encoder。在多层 Self-Attention 的作用下，第 0 位的 [CLS] Token 吸取和概括后面 40 帧图像中的所有因果、时序、空间变化信息。
 
 7. 提取第 0 位 [CLS] 并归一化
-- 通过切片操作，模型抛弃后面 1 至 40 位的具体帧特征，仅仅提取出第 0 位的 [CLS] 向量。此时引入 Batch Size (B)，张量收拢为 [B, 768] 的二维矩阵（视频全局特征）。最后，经过 L2 Normalize（L2 归一化），消除尺度影响，得到用于对齐的 [B, 768] 最终视觉向量。
+- 通过切片操作，模型抛弃后面 1 至 40 位的具体帧特征，仅仅提取出第 0 位的 [CLS] 向量。此时引入 Batch Size (B)，张量收拢为 [B, 768] 的二维矩阵（视频全局特征）。
+
+8. 投影映射层与归一化
+- 基于 Contrastive Manifold Alignment（对比流形对齐） 策略，增加 Vision Projector 进行线性/非线性流形变换。
+- 经过 L2 Normalize（L2 归一化），消除尺度影响，得到用于对齐的 [B, 768] 最终视觉向量。
 
 ## 文本塔数据流
 文本塔的目标是将自然语言描述，转化为与视觉向量处于同一几何超平面的 [B, 768] 向量。
@@ -89,7 +109,8 @@ tools: [ "#codebase", "#terminal" ]
 - 消除变长序列长度后，张量完美坍缩为固定大小的 [B, 768] 变长句向量。
 
 6. 投影映射层与归一化
-- 由于 DeBERTa 是冻结的，生来与视觉空间不通，因此需要将其送入一个可训练的 Text Projector（同维对齐映射层） 进行线性/非线性流形变换。随后同样进行 L2 Normalize（L2 归一化），最终吐出标准规格的 [B, 768] 最终文本向量。
+- 由于 DeBERTa 是冻结的，生来与视觉空间不通，因此需要将其送入一个可训练的 Text Projector（同维对齐映射层） 进行线性/非线性流形变换。
+- 随后同样进行 L2 Normalize（L2 归一化），最终吐出标准规格的 [B, 768] 最终文本向量。
 
 ## 跨模态对齐交互
 当左塔吐出 [B, 768] 的视觉向量，右塔吐出 [B, 768] 的文本向量后，两边在最底层完成闭环。
@@ -99,6 +120,8 @@ tools: [ "#codebase", "#terminal" ]
 
 2. 对比损失计算
 - 在这个 [B, B] 的对齐矩阵上，正对角线（i=j 的位置）代表图像和文本完美匹配的真值，其余位置均为负样本。模型通过计算 InfoNCE Loss（对比损失函数），以极高的梯度拉近正样本对在 768 维空间中的距离，同时推开负样本对。
+
+3. 支持多卡 DDP Gather
 
 ## 权重文件
 从物理文件上看，你的项目涉及 3 个部分的权重。
@@ -120,6 +143,15 @@ tools: [ "#codebase", "#terminal" ]
 
 ## 配置文件
 1. 1份配置文件
-- 在 configs/ 目录下，新建目录 bevformer_vlm_align/ ， 在 configs/bevformer_vlm_align/ 目录下新建一个 bevformer_vlm_align.py 的文件。它的内部结构通常是通过 _base_（继承机制） 把原有的配置吸纳进来，然后在一个全局的 model 字典里把三者拼接起来。
+- 在 configs/ 目录下，新建目录 bevformer_vlm_align/ ， 在 configs/bevformer_vlm_align/ 目录下新建一个 bevformerv2-r50-t8-24ep_debertav3_align.py 的文件。它的内部结构通常是通过 _base_（继承机制） 把原有的配置吸纳进来，然后在一个全局的 model 字典里把三者拼接起来。
 - BEVFormer-v2的配置文件是 projects/bevformerv2-r50-t8-24ep.py。
 - DeBERTa-v3的配置文件是通过 Hugging Face 下载 “microsoft/deberta-v3-base” 相关。
+
+## 约束
+1. 1D Temporal PE 注入时切记要给 [CLS] 做 Padding（或跳过）
+- 在将 [40, 768] 拼入 [CLS] 变成 [41, 768] 后注入 1D PE 时，代码通常是：x = x + self.temporal_pe。
+- 注意你的 self.temporal_pe 必须是 [41, 768]。请确保第 0 位（即对应 [CLS] 的那一位位置编码）是一个固定的常数（如全零），或者是单独可学习的参数。不要让第 1 帧的位置编码错位加到了 [CLS] 上，否则会导致时序混乱。
+
+2. Dataloader 侧的 Spatial PE 尺寸匹配
+- 你的 BEV 稠密特征是 [40, 40000, 256]（对应 200 x 200 = 40000）。
+- 在生成 2D Spatial PE 时，建议直接在 __init__ 中用 nn.Parameter 初始化一个 [200, 200, 256] 的可学习位置嵌入，在前向传播时用 view(1, 40000, 256) 展平，然后用 PyTorch 的广播机制直接加到 40 帧上：feat = feat + self.spatial_pe.view(1, 1, 40000, 256)。（feat 形状: [B, 40, 40000, 256]），这样可以保证时序上的每一帧都共享同一套标准的车体坐标系空间编码，这最符合自动驾驶 BEV 空间的物理规律。
