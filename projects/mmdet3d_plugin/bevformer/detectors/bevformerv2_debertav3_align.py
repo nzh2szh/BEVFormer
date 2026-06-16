@@ -1,6 +1,8 @@
 import json
 import math
 import os
+import secrets
+import warnings
 from collections import OrderedDict
 
 import torch
@@ -40,6 +42,9 @@ class BEVFormerDebertaAlign(BEVFormerV2):
 
     def __init__(self,
                  text_model_name='microsoft/deberta-v3-base',
+                 text_model_revision=None,
+                 text_model_local_files_only=False,
+                 text_model_cache_dir=None,
                  scene_json='data/nuscenes/v1.0-trainval/scene.json',
                  scene_text_field='description',
                  expected_frames=40,
@@ -54,12 +59,24 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                  spatial_bev_h=200,
                  spatial_bev_w=200,
                  gather_ddp=True,
+                 run_mode='online',
+                 offline_bev_dir='',
+                 offline_bev_dir_by_split=None,
+                 offline_split=None,
+                 offline_metadata_name='bev_feature.json',
+                 offline_dump_overwrite=False,
                  **kwargs):
         """Initialize BEVFormer-DeBERTa alignment model.
 
         Args:
             text_model_name (str): Hugging Face model name/path for the frozen
                 text encoder (e.g. microsoft/deberta-v3-base).
+            text_model_revision (str | None): Optional Hugging Face revision
+                (branch/tag/commit hash) for reproducible text model loading.
+            text_model_local_files_only (bool): If True, only load text model
+                files from local cache/path and never access network.
+            text_model_cache_dir (str | None): Optional cache directory passed
+                to Hugging Face `from_pretrained`.
             scene_json (str): Path to scene metadata file used to map
                 scene_token -> text description.
             scene_text_field (str): Field name in scene.json used as text
@@ -85,6 +102,31 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 embedding.
             gather_ddp (bool): Whether to all-gather features across DDP
                 workers when computing contrastive loss.
+                        run_mode (str): Runtime mode for compatibility scenarios.
+                                Supported values:
+                                - origin: original mode, extract BEV features online.
+                                    compatiblity of alias online.
+                                - offline_extract_bev: extract and dump BEV features only.
+                                    compatiblity of alias extract.
+                                - offline_train: load BEV features from offline directory
+                                    before training head.
+                                - offline_infer: load BEV features from offline directory
+                                    before inference.
+                                - offline_infer_validate: same as offline_infer for
+                                    inference+validation workflow.
+                        offline_bev_dir (str): Directory containing dumped BEV feature
+                                pth files and metadata json.
+                        offline_bev_dir_by_split (dict | None): Optional split-aware
+                            directories, e.g. {'train': '...', 'val': '...',
+                            'test': '...'}. When provided, it overrides
+                            `offline_bev_dir` for the active split.
+                        offline_split (str | None): Active split key used with
+                            `offline_bev_dir_by_split`. If None, a default
+                            split is chosen from run_mode.
+                        offline_metadata_name (str): Metadata json filename under
+                                offline_bev_dir.
+                        offline_dump_overwrite (bool): Whether overwrite existed pth/json
+                                when dumping BEV features in extract mode.
             **kwargs: Remaining BEVFormerV2 initialization arguments.
         """
         super().__init__(**kwargs)
@@ -104,9 +146,54 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         self.spatial_bev_h = spatial_bev_h
         self.spatial_bev_w = spatial_bev_w
         self.gather_ddp = gather_ddp
+        self.run_mode = run_mode
+        self.offline_bev_dir = offline_bev_dir
+        self.offline_bev_dir_by_split = offline_bev_dir_by_split or {}
+        self.offline_split = offline_split
+        self.offline_metadata_name = offline_metadata_name
+        self.offline_dump_overwrite = offline_dump_overwrite
 
-        self.tokenizer = AutoTokenizer.from_pretrained(text_model_name)
-        self.text_encoder = AutoModel.from_pretrained(text_model_name)
+        mode_alias = {
+            'origin': 'online',
+            'offline_extract_bev': 'extract',
+        }
+        self.run_mode = mode_alias.get(self.run_mode, self.run_mode)
+
+        self._valid_run_modes = {
+            'online',
+            'extract',
+            'offline_train',
+            'offline_infer',
+            'offline_infer_validate',
+        }
+        if self.run_mode not in self._valid_run_modes:
+            raise ValueError(
+                'Unsupported run_mode: {}. valid modes are {}.'.format(
+                    self.run_mode,
+                    sorted(self._valid_run_modes),
+                )
+            )
+
+        if not isinstance(self.offline_bev_dir_by_split, dict):
+            raise TypeError('offline_bev_dir_by_split must be a dict when provided.')
+        if self.offline_split is None:
+            self.offline_split = self._default_offline_split()
+
+        self._offline_records = []
+        self._offline_record_index = {}
+        if self.run_mode in {'offline_train', 'offline_infer', 'offline_infer_validate'}:
+            self._load_offline_bev_index()
+
+        text_load_kwargs = {}
+        if text_model_revision is not None:
+            text_load_kwargs['revision'] = text_model_revision
+        if text_model_local_files_only:
+            text_load_kwargs['local_files_only'] = True
+        if text_model_cache_dir is not None:
+            text_load_kwargs['cache_dir'] = text_model_cache_dir
+
+        self.tokenizer = AutoTokenizer.from_pretrained(text_model_name, **text_load_kwargs)
+        self.text_encoder = AutoModel.from_pretrained(text_model_name, **text_load_kwargs)
         self._freeze_module(self.text_encoder)
 
         # Learnable 2D BEV positional embedding shared across all frames.
@@ -150,6 +237,8 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / temperature)))
 
         self.scene_token_to_text = self._load_scene_text_map()
+        self.scene_token_to_name = self._load_scene_name_map()
+        self.scene_sample_order = self._load_scene_sample_order_map()
         self._freeze_visual_backbone()
 
     def _freeze_module(self, module):
@@ -209,6 +298,92 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 text_map[token] = desc
         return text_map
 
+    def _load_scene_name_map(self):
+        """Load scene token -> scene name mapping from scene.json."""
+        name_map = {}
+        if not self.scene_json:
+            return name_map
+        if not os.path.isfile(self.scene_json):
+            return name_map
+
+        with open(self.scene_json, 'r', encoding='utf-8') as f:
+            scene_records = json.load(f)
+
+        for record in scene_records:
+            token = record.get('token', '')
+            name = record.get('name', '')
+            if token and name:
+                name_map[token] = name
+        return name_map
+
+    def _load_scene_sample_order_map(self):
+        """Build scene-token + sample-token -> sequential frame index map.
+
+        The order is derived from scene.json (first/last/nbr_samples) and
+        sample.json linked-list traversal, matching nuScenes metadata.
+        """
+        order_map = {}
+        if not self.scene_json or (not os.path.isfile(self.scene_json)):
+            raise FileNotFoundError('scene.json not found: {}'.format(self.scene_json))
+
+        sample_json = os.path.join(os.path.dirname(self.scene_json), 'sample.json')
+        if not os.path.isfile(sample_json):
+            raise FileNotFoundError('sample.json not found next to scene.json: {}'.format(sample_json))
+
+        with open(self.scene_json, 'r', encoding='utf-8') as f:
+            scene_records = json.load(f)
+        with open(sample_json, 'r', encoding='utf-8') as f:
+            sample_records = json.load(f)
+
+        sample_by_token = {}
+        for rec in sample_records:
+            token = rec.get('token', '') if isinstance(rec, dict) else ''
+            if token:
+                sample_by_token[token] = rec
+
+        for scene in scene_records:
+            if not isinstance(scene, dict):
+                continue
+            scene_token = scene.get('token', '')
+            first_token = scene.get('first_sample_token', '')
+            last_token = scene.get('last_sample_token', '')
+            nbr_samples = scene.get('nbr_samples', None)
+            if not scene_token or not first_token:
+                continue
+
+            idx = 0
+            token = first_token
+            visited = set()
+            while token:
+                if token in visited:
+                    warnings.warn(
+                        'Detected sample token loop in scene {} at token {}'.format(scene_token, token)
+                    )
+                    break
+                visited.add(token)
+
+                rec = sample_by_token.get(token)
+                if rec is None:
+                    warnings.warn(
+                        'sample token {} from scene {} is missing in sample.json'.format(token, scene_token)
+                    )
+                    break
+
+                order_map['{}::{}'.format(scene_token, token)] = idx
+                idx += 1
+
+                if token == last_token:
+                    break
+                token = rec.get('next', '')
+
+            if isinstance(nbr_samples, int) and nbr_samples > 0 and idx != nbr_samples:
+                warnings.warn(
+                    'scene {} sample count mismatch: traversed {} vs nbr_samples {}'.format(
+                        scene_token, idx, nbr_samples)
+                )
+
+        return order_map
+
     def _parse_temporal_meta(self, img_metas):
         """Sort temporal keys so frame order is deterministic.
 
@@ -223,6 +398,248 @@ class BEVFormerDebertaAlign(BEVFormerV2):
             ordered = OrderedDict(sorted(sample_meta.items(), key=lambda x: x[0]))
             temporal_metas.append(ordered)
         return temporal_metas
+
+    def _get_anchor_meta(self, sample_metas):
+        """Pick anchor frame meta for naming and indexing.
+
+        Priority uses key 0 (current frame). If absent, use largest key as the
+        nearest-to-current fallback.
+        """
+        if 0 in sample_metas:
+            return sample_metas[0]
+        last_key = max(sample_metas.keys())
+        return sample_metas[last_key]
+
+    def _get_scene_token_and_group(self, sample_metas):
+        """Get (scene_token, frame_nbr, frame_token) from temporal metadata."""
+        anchor_meta = self._get_anchor_meta(sample_metas)
+        scene_token = anchor_meta.get('scene_token', '')
+        sample_token = anchor_meta.get('sample_idx', '')
+        if not scene_token:
+            raise KeyError('scene_token is missing in img_metas anchor frame.')
+        if not sample_token:
+            raise KeyError('sample_idx(frame token) is missing in img_metas anchor frame.')
+
+        order_key = '{}::{}'.format(scene_token, sample_token)
+        if order_key not in self.scene_sample_order:
+            raise KeyError(
+                'frame token {} is not found in scene {} sample chain built from scene.json/sample.json'.format(
+                    sample_token, scene_token)
+            )
+        return scene_token, int(self.scene_sample_order[order_key]), sample_token
+
+    def _sanitize_filename_part(self, text):
+        if text is None:
+            return ''
+        return str(text).replace('/', '_').replace(' ', '_')
+
+    def _offline_feature_filename(self, scene_name, scene_token, keyframe_nbr):
+        """Build feature filename as scene_number_token.pth style."""
+        safe_scene = self._sanitize_filename_part(scene_name) or 'unknown_scene'
+        safe_token = self._sanitize_filename_part(scene_token) or 'unknown_token'
+        return '{}_{}_{}.pth'.format(safe_scene, keyframe_nbr, safe_token)
+
+    def _offline_metadata_path(self):
+        active_dir = self._get_active_offline_bev_dir()
+        if not active_dir:
+            return ''
+        return os.path.join(active_dir, self.offline_metadata_name)
+
+    def _default_offline_split(self):
+        if self.run_mode == 'offline_train':
+            return 'train'
+        if self.run_mode == 'offline_infer_validate':
+            return 'val'
+        if self.run_mode == 'offline_infer':
+            return 'test'
+        if self.run_mode == 'extract':
+            return 'train'
+        return None
+
+    def _get_active_offline_bev_dir(self):
+        if self.offline_split and self.offline_split in self.offline_bev_dir_by_split:
+            split_dir = self.offline_bev_dir_by_split.get(self.offline_split)
+            if split_dir:
+                return split_dir
+        return self.offline_bev_dir
+
+    def _is_rank0(self):
+        if not dist.is_available() or not dist.is_initialized():
+            return True
+        return dist.get_rank() == 0
+
+    def _load_offline_bev_index(self):
+        """Load bev_feature.json into fast index for offline read mode."""
+        active_dir = self._get_active_offline_bev_dir()
+        meta_path = self._offline_metadata_path()
+        if not active_dir:
+            raise ValueError('offline_bev_dir is required for offline_* modes.')
+        if not os.path.isdir(active_dir):
+            raise FileNotFoundError(
+                'offline_bev_dir does not exist: {}'.format(active_dir)
+            )
+        if not os.path.isfile(meta_path):
+            raise FileNotFoundError(
+                'Offline metadata file not found: {}'.format(meta_path)
+            )
+
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            records = json.load(f)
+        if not isinstance(records, list):
+            raise ValueError('Offline metadata must be a JSON list.')
+
+        self._offline_records = records
+        self._offline_record_index = {}
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            scene_token = rec.get('scene_token', '')
+            frame_nbr = rec.get('frame_nbr', '')
+            if scene_token == '' or frame_nbr == '':
+                continue
+            try:
+                key = '{}::{}'.format(scene_token, int(frame_nbr))
+            except (TypeError, ValueError):
+                continue
+            self._offline_record_index[key] = rec
+
+    def _dump_bev_features(self, bev_seq, img_metas):
+        """Dump each sample BEV feature to pth and update bev_feature.json."""
+        active_dir = self._get_active_offline_bev_dir()
+        if not active_dir:
+            raise ValueError('offline_bev_dir is required for extract mode.')
+        if not self._is_rank0():
+            return
+
+        os.makedirs(active_dir, exist_ok=True)
+
+        temporal_metas = self._parse_temporal_meta(img_metas)
+        updated = False
+
+        for b, sample_metas in enumerate(temporal_metas):
+            scene_token, frame_nbr, frame_token = self._get_scene_token_and_group(sample_metas)
+            if not scene_token:
+                continue
+
+            frame_keys = list(sample_metas.keys())
+            anchor_key = 0 if 0 in sample_metas else max(sample_metas.keys())
+            if anchor_key not in frame_keys:
+                raise KeyError('Anchor key {} is not found in temporal metadata keys.'.format(anchor_key))
+            anchor_idx = frame_keys.index(anchor_key)
+            if anchor_idx >= bev_seq.shape[1]:
+                raise IndexError(
+                    'Anchor index {} out of range for BEV sequence length {}.'.format(
+                        anchor_idx, bev_seq.shape[1])
+                )
+
+            anchor_meta = sample_metas[anchor_key]
+            anchor_frame_token = anchor_meta.get('sample_idx', '')
+            if anchor_frame_token != frame_token:
+                raise ValueError(
+                    'Frame token mismatch between mapping and anchor meta: mapped={}, anchor={}'.format(
+                        frame_token, anchor_frame_token)
+                )
+
+            scene_name = anchor_meta.get('scene_name', '')
+            if not scene_name:
+                scene_name = self.scene_token_to_name.get(scene_token, '')
+
+            filename = self._offline_feature_filename(scene_name, scene_token, frame_nbr)
+            filepath = os.path.join(active_dir, filename)
+            if (not os.path.isfile(filepath)) or self.offline_dump_overwrite:
+                # Dump one BEV frame [1, HW, C] by exact anchor frame index.
+                single_bev = bev_seq[b, anchor_idx:anchor_idx + 1, :, :].detach().cpu()
+                torch.save(single_bev, filepath)
+
+            key = '{}::{}'.format(scene_token, int(frame_nbr))
+            prev_rec = self._offline_record_index.get(key, {})
+            if isinstance(prev_rec, dict):
+                record_token = prev_rec.get('token', '')
+            else:
+                record_token = ''
+            if not record_token:
+                # Keep the same semantics as `openssl rand -hex 16`.
+                record_token = secrets.token_hex(16)
+
+            rec = {
+                'token': record_token,
+                'scene_token': scene_token,
+                'frame_nbr': int(frame_nbr),
+                'frame_token': frame_token,
+                'filename': filename,
+            }
+            self._offline_record_index[key] = rec
+            updated = True
+
+        if updated:
+            records = list(self._offline_record_index.values())
+            records.sort(key=lambda x: (x.get('scene_token', ''), int(x.get('frame_nbr', 0))))
+            meta_path = self._offline_metadata_path()
+            with open(meta_path, 'w', encoding='utf-8') as wf:
+                json.dump(records, wf, ensure_ascii=False, indent=2)
+            self._offline_records = records
+
+    def _load_offline_bev_sequence(self, img_metas, device):
+        """Load BEV sequence tensor [B, T, HW, C] from offline pth files."""
+        temporal_metas = self._parse_temporal_meta(img_metas)
+        batch_bev = []
+        for sample_metas in temporal_metas:
+            scene_token, frame_nbr, _ = self._get_scene_token_and_group(sample_metas)
+            key = '{}::{}'.format(scene_token, int(frame_nbr))
+
+            record = self._offline_record_index.get(key)
+            if record is None:
+                raise KeyError(
+                    'Missing offline BEV index in metadata for scene_token={} frame_nbr={}. '
+                    'Please check {}.'.format(
+                        scene_token,
+                        frame_nbr,
+                        self._offline_metadata_path(),
+                    )
+                )
+
+            filename = record.get('filename', '')
+            if not filename:
+                raise KeyError(
+                    'Offline metadata entry missing filename for scene_token={} frame_nbr={}. '
+                    'Please check {}.'.format(
+                        scene_token,
+                        frame_nbr,
+                        self._offline_metadata_path(),
+                    )
+                )
+            active_dir = self._get_active_offline_bev_dir()
+            filepath = os.path.join(active_dir, filename)
+            if not os.path.isfile(filepath):
+                raise FileNotFoundError(
+                    'Offline BEV feature not found for {} frame {}: {}'.format(
+                        scene_token, frame_nbr, filepath)
+                )
+
+            loaded = torch.load(filepath, map_location='cpu')
+            if isinstance(loaded, dict):
+                if 'bev_feature' in loaded:
+                    loaded = loaded['bev_feature']
+                elif 'state_dict' in loaded and isinstance(loaded['state_dict'], torch.Tensor):
+                    loaded = loaded['state_dict']
+                else:
+                    raise ValueError('Unsupported offline BEV pth payload format: {}'.format(filepath))
+
+            if loaded.dim() != 3:
+                raise ValueError(
+                    'Offline BEV feature must be a single-frame tensor [1, HW, C], got {} from {}'.format(
+                        tuple(loaded.shape), filepath)
+                )
+            if loaded.shape[0] != 1:
+                raise ValueError(
+                    'Legacy multi-frame offline BEV is no longer supported. '
+                    'Expected [1, HW, C], got {} from {}'.format(tuple(loaded.shape), filepath)
+                )
+
+            batch_bev.append(loaded)
+
+        bev_seq = torch.stack(batch_bev, dim=0).to(device=device)
+        return self._uniform_temporal_length(bev_seq)
 
     def _uniform_temporal_length(self, bev_seq):
         """Resize temporal length to expected_frames by sample/pad.
@@ -352,8 +769,8 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         texts = []
         temporal_metas = self._parse_temporal_meta(img_metas)
         for sample_metas in temporal_metas:
-            first_key = next(iter(sample_metas.keys()))
-            token = sample_metas[first_key].get('scene_token', '')
+            anchor_meta = self._get_anchor_meta(sample_metas)
+            token = anchor_meta.get('scene_token', '')
             text = self.scene_token_to_text.get(token, token)
             texts.append(text)
         return texts
@@ -453,7 +870,22 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         if img_metas is None:
             raise ValueError('img_metas is required for BEVFormerDebertaAlign.')
 
-        bev_seq = self._extract_bev_sequence(img, img_metas)
+        if self.run_mode == 'offline_train':
+            bev_seq = self._load_offline_bev_sequence(img_metas, device=img.device)
+        else:
+            bev_seq = self._extract_bev_sequence(img, img_metas)
+
+        if self.run_mode == 'extract':
+            self._dump_bev_features(bev_seq, img_metas)
+            # Keep training loop compatible while skipping optimization target.
+            # Use an explicit grad-enabled scalar to avoid backward failure
+            # when bev_seq is produced under no_grad in extract mode.
+            return {
+                'loss_align': torch.zeros((), device=bev_seq.device, requires_grad=True),
+                'acc_i2t_top1': bev_seq.new_tensor(0.0),
+                'acc_t2i_top1': bev_seq.new_tensor(0.0),
+            }
+
         vision_feat = self._encode_vision(bev_seq)
         texts = self._resolve_scene_text(img_metas, scene_text=scene_text)
         text_feat = self._encode_text(texts, device=img.device)
@@ -478,7 +910,15 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         if img is None:
             raise ValueError('img is required for BEVFormerDebertaAlign.')
 
-        bev_seq = self._extract_bev_sequence(img, img_metas)
+        if self.run_mode in {'offline_infer', 'offline_infer_validate'}:
+            bev_seq = self._load_offline_bev_sequence(img_metas, device=img.device)
+        else:
+            bev_seq = self._extract_bev_sequence(img, img_metas)
+
+        if self.run_mode == 'extract':
+            self._dump_bev_features(bev_seq, img_metas)
+            return [{'extract_saved': True} for _ in range(bev_seq.shape[0])]
+
         vision_feat = self._encode_vision(bev_seq)
         texts = self._resolve_scene_text(img_metas, scene_text=scene_text)
         text_feat = self._encode_text(texts, device=img.device)

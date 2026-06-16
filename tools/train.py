@@ -30,6 +30,72 @@ from mmseg import __version__ as mmseg_version
 from mmcv.utils import TORCH_VERSION, digit_version
 
 
+def _resolve_extract_mode(cfg):
+    model_cfg = cfg.get('model', {})
+    if not isinstance(model_cfg, dict):
+        return None, None
+    run_mode = model_cfg.get('run_mode', None)
+    if run_mode is None:
+        return None, None
+
+    mode_alias = {
+        'origin': 'online',
+        'offline_extract_bev': 'extract',
+    }
+    resolved_mode = mode_alias.get(run_mode, run_mode)
+    split = model_cfg.get('offline_split', None)
+    if split is None:
+        split = 'train'
+    return resolved_mode, split
+
+
+def _strip_dataloader_keys(dataset_cfg):
+    """Recursively remove dataloader-only keys before build_dataset."""
+    dataloader_only_keys = {
+        'samples_per_gpu',
+        'workers_per_gpu',
+        'persistent_workers',
+        'num_gpus',
+        'dist',
+        'shuffle',
+        'seed',
+        'drop_last',
+        'pin_memory',
+        'prefetch_factor',
+        'timeout',
+        'sampler',
+        'batch_sampler',
+    }
+
+    if isinstance(dataset_cfg, list):
+        return [_strip_dataloader_keys(x) for x in dataset_cfg]
+    if not isinstance(dataset_cfg, dict):
+        return dataset_cfg
+
+    sanitized = {}
+    for key, val in dataset_cfg.items():
+        if key in dataloader_only_keys:
+            continue
+        sanitized[key] = _strip_dataloader_keys(val)
+    return sanitized
+
+
+def _set_dataset_flag(dataset_cfg, key, value):
+    """Recursively set dataset flags for plain/Concat/Repeat wrappers."""
+    if isinstance(dataset_cfg, list):
+        for item in dataset_cfg:
+            _set_dataset_flag(item, key, value)
+        return
+    if not isinstance(dataset_cfg, dict):
+        return
+
+    dataset_cfg[key] = value
+    if isinstance(dataset_cfg.get('dataset', None), dict):
+        _set_dataset_flag(dataset_cfg['dataset'], key, value)
+    if isinstance(dataset_cfg.get('datasets', None), list):
+        _set_dataset_flag(dataset_cfg['datasets'], key, value)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('config', help='train config file path')
@@ -223,6 +289,61 @@ def main():
     model.init_weights()
 
     logger.info(f'Model:\n{model}')
+
+    resolved_mode, offline_split = _resolve_extract_mode(cfg)
+    if resolved_mode == 'extract':
+        if offline_split not in {'train', 'val', 'test'}:
+            raise ValueError(
+                'Invalid model.offline_split={} in extract mode; expected train/val/test.'.format(
+                    offline_split)
+            )
+
+        split_cfg = cfg.data.get(offline_split, None)
+        if split_cfg is None:
+            raise KeyError(
+                'cfg.data.{} is required in extract mode when model.offline_split={}.'.format(
+                    offline_split, offline_split)
+            )
+
+        cfg.data.train = _strip_dataloader_keys(split_cfg)
+
+        val_cfg = cfg.data.get('val', None)
+        val_pipeline = None
+        if isinstance(val_cfg, dict):
+            val_pipeline = val_cfg.get('pipeline', None)
+
+        if val_pipeline is not None:
+            # Export path should be deterministic; always use eval-style pipeline.
+            cfg.data.train['pipeline'] = copy.deepcopy(val_pipeline)
+        elif isinstance(cfg.data.train, dict) and cfg.data.train.get('pipeline', None) is not None:
+            # Fallback: keep split pipeline when val pipeline is unavailable.
+            cfg.data.train['pipeline'] = copy.deepcopy(cfg.data.train['pipeline'])
+
+        if isinstance(cfg.data.train, dict):
+            cfg.data.train['test_mode'] = False
+            # Extract mode may use eval-style pipelines without gt_labels_3d.
+            # Disable empty-gt filtering to avoid KeyError in prepare_train_data.
+            _set_dataset_flag(cfg.data.train, 'filter_empty_gt', False)
+
+        logger.info(
+            'Extract mode detected: remap data.train to cfg.data.%s and force eval pipeline for offline BEV dump.',
+            offline_split,
+        )
+        train_ann_file = cfg.data.train.get('ann_file', '<missing ann_file>')
+        model_scene_json = cfg.model.get('scene_json', '<missing scene_json>')
+        train_pipeline = cfg.data.train.get('pipeline', [])
+        if isinstance(train_pipeline, list):
+            pipeline_types = [p.get('type', 'Unknown') for p in train_pipeline if isinstance(p, dict)]
+        else:
+            pipeline_types = ['<non-list pipeline>']
+        logger.info(
+            'Offline extract source summary: split=%s, ann_file=%s, scene_json=%s, pipeline=%s',
+            offline_split,
+            train_ann_file,
+            model_scene_json,
+            ' -> '.join(pipeline_types),
+        )
+
     datasets = [build_dataset(cfg.data.train)]
     if len(cfg.workflow) == 2:
         val_dataset = copy.deepcopy(cfg.data.val)

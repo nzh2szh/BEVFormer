@@ -108,15 +108,17 @@ class GridMask(nn.Module):
         r = np.random.randint(self.rotate)
         mask = Image.fromarray(np.uint8(mask))
         mask = mask.rotate(r)
-        mask = np.asarray(mask)
+        # Make writable contiguous ndarray before converting to tensor.
+        mask = np.asarray(mask).copy()
         mask = mask[(hh-h)//2:(hh-h)//2+h, (ww-w)//2:(ww-w)//2+w]
 
-        mask = torch.from_numpy(mask).to(x.dtype).cuda()
+        mask = torch.from_numpy(mask).to(device=x.device, dtype=x.dtype)
         if self.mode == 1:
             mask = 1-mask
         mask = mask.expand_as(x)
         if self.offset:
-            offset = torch.from_numpy(2 * (np.random.rand(h,w) - 0.5)).to(x.dtype).cuda()
+            offset_np = (2 * (np.random.rand(h, w) - 0.5)).astype(np.float32)
+            offset = torch.from_numpy(offset_np).to(device=x.device, dtype=x.dtype)
             x = x * mask + offset * (1 - mask)
         else:
             x = x * mask 

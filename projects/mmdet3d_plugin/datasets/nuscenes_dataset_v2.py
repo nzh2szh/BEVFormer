@@ -82,7 +82,9 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
         # cur_frame_idx = input_dict['frame_idx']
         ann_info = copy.deepcopy(input_dict['ann_info'])
         self.pre_pipeline(input_dict)
-        example = self.pipeline(input_dict)
+        example = self._to_single_aug_sample(self.pipeline(input_dict))
+        if example is None:
+            return None
         if self.filter_empty_gt and \
                 (example is None or ~(example['gt_labels_3d']._data != -1).any()):
             return None
@@ -100,17 +102,43 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
                 input_dict['ann_info'] = copy.deepcopy(ann_info) # only for pipeline, should never be used 
                 self.pre_pipeline(input_dict)
                 input_dict['aug_param'] = copy.deepcopy(aug_param)
-                example = self.pipeline(input_dict)
+                example = self._to_single_aug_sample(self.pipeline(input_dict))
+                if example is None:
+                    continue
                 data_queue[frame_idx] = example
 
         data_queue = OrderedDict(sorted(data_queue.items()))
         return self.union2one(data_queue)
 
+    def _to_single_aug_sample(self, example):
+        """Normalize pipeline output to one single-augmentation sample dict."""
+        if isinstance(example, list):
+            if len(example) == 0:
+                return None
+            example = example[0]
+        if not isinstance(example, dict):
+            return example
+
+        single = {}
+        for key, value in example.items():
+            if isinstance(value, list):
+                single[key] = value[0] if len(value) > 0 else value
+            else:
+                single[key] = value
+        return single
+
     def union2one(self, queue: dict):
         """
         convert sample queue into one single sample.
         """
-        imgs_list = [each['img'].data for each in queue.values()]
+        imgs_list = []
+        for each in queue.values():
+            img_field = each['img']
+            if isinstance(img_field, list):
+                if len(img_field) == 0:
+                    continue
+                img_field = img_field[0]
+            imgs_list.append(img_field.data)
         lidar2ego = np.eye(4, dtype=np.float32)
         lidar2ego[:3, :3] = Quaternion(queue[0]['lidar2ego_rotation']).rotation_matrix
         lidar2ego[:3, 3] = queue[0]['lidar2ego_translation']
@@ -120,7 +148,12 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
         egocurr2global[:3,3] = queue[0]['ego2global_translation']
         metas_map = {}
         for i, each in queue.items():
-            metas_map[i] = each['img_metas'].data
+            img_metas_field = each['img_metas']
+            if isinstance(img_metas_field, list):
+                if len(img_metas_field) == 0:
+                    continue
+                img_metas_field = img_metas_field[0]
+            metas_map[i] = img_metas_field.data
             metas_map[i]['timestamp'] = each['timestamp']
             if 'aug_param' in each:
                 metas_map[i]['aug_param'] = each['aug_param']

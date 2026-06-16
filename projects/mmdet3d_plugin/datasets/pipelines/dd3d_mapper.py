@@ -18,10 +18,11 @@ class DD3DMapper:
         self.task_manager = TaskManager(**tasks)
 
     def __call__(self, results):
-        if results['mono_input_dict'] is None:
+        mono_inputs = results.get('mono_input_dict', None)
+        if mono_inputs is None:
             return results
         mono_input_dict = []
-        for dataset_dict in results['mono_input_dict']:
+        for dataset_dict in mono_inputs:
             dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
             image_shape = results['img'].data.shape[-2:]
             intrinsics = None

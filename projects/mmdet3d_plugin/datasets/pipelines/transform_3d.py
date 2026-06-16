@@ -276,9 +276,11 @@ class CustomCollect3D(object):
         data['img_metas'] = DC(img_metas, cpu_only=True)
         for key in self.keys:
             if key not in results:
-                data[key] = None 
-            else:
-                data[key] = results[key]
+                # Optional fields (e.g. mono branches) may be absent in some
+                # tasks/configs. Do not inject None to avoid DataLoader
+                # collate failures on mixed samples.
+                continue
+            data[key] = results[key]
         return data
 
     def __repr__(self):
