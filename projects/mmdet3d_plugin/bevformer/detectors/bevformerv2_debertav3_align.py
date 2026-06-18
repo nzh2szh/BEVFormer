@@ -606,12 +606,49 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         batch_bev = []
         for sample_metas in temporal_metas:
             scene_token, frame_nbr, _ = self._get_scene_token_and_group(sample_metas)
-            key = '{}::{}'.format(scene_token, int(frame_nbr))
+            # Build a temporal clip by tracing historical frame_nbr values.
+            # This avoids the previous behavior that loaded only the anchor
+            # frame and then repeated it to expected_frames.
+            clip_start = max(0, int(frame_nbr) - self.expected_frames + 1)
+            clip_frames = []
+            for hist_nbr in range(clip_start, int(frame_nbr) + 1):
+                key = '{}::{}'.format(scene_token, hist_nbr)
+                record = self._offline_record_index.get(key)
+                if record is None:
+                    continue
+                filename = record.get('filename', '')
+                if not filename:
+                    continue
+                active_dir = self._get_active_offline_bev_dir()
+                filepath = os.path.join(active_dir, filename)
+                if not os.path.isfile(filepath):
+                    continue
 
-            record = self._offline_record_index.get(key)
-            if record is None:
+                loaded = torch.load(filepath, map_location='cpu')
+                if isinstance(loaded, dict):
+                    if 'bev_feature' in loaded:
+                        loaded = loaded['bev_feature']
+                    elif 'state_dict' in loaded and isinstance(loaded['state_dict'], torch.Tensor):
+                        loaded = loaded['state_dict']
+                    else:
+                        raise ValueError('Unsupported offline BEV pth payload format: {}'.format(filepath))
+
+                if loaded.dim() != 3:
+                    raise ValueError(
+                        'Offline BEV feature must be a single-frame tensor [1, HW, C], got {} from {}'.format(
+                            tuple(loaded.shape), filepath)
+                    )
+                if loaded.shape[0] != 1:
+                    raise ValueError(
+                        'Legacy multi-frame offline BEV is no longer supported. '
+                        'Expected [1, HW, C], got {} from {}'.format(tuple(loaded.shape), filepath)
+                    )
+
+                clip_frames.append(loaded)
+
+            if len(clip_frames) == 0:
                 raise KeyError(
-                    'Missing offline BEV index in metadata for scene_token={} frame_nbr={}. '
+                    'Missing offline BEV sequence for scene_token={} frame_nbr={}. '
                     'Please check {}.'.format(
                         scene_token,
                         frame_nbr,
@@ -619,47 +656,10 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                     )
                 )
 
-            filename = record.get('filename', '')
-            if not filename:
-                raise KeyError(
-                    'Offline metadata entry missing filename for scene_token={} frame_nbr={}. '
-                    'Please check {}.'.format(
-                        scene_token,
-                        frame_nbr,
-                        self._offline_metadata_path(),
-                    )
-                )
-            active_dir = self._get_active_offline_bev_dir()
-            filepath = os.path.join(active_dir, filename)
-            if not os.path.isfile(filepath):
-                raise FileNotFoundError(
-                    'Offline BEV feature not found for {} frame {}: {}'.format(
-                        scene_token, frame_nbr, filepath)
-                )
+            sample_bev = torch.cat(clip_frames, dim=0).unsqueeze(0)
+            batch_bev.append(sample_bev)
 
-            loaded = torch.load(filepath, map_location='cpu')
-            if isinstance(loaded, dict):
-                if 'bev_feature' in loaded:
-                    loaded = loaded['bev_feature']
-                elif 'state_dict' in loaded and isinstance(loaded['state_dict'], torch.Tensor):
-                    loaded = loaded['state_dict']
-                else:
-                    raise ValueError('Unsupported offline BEV pth payload format: {}'.format(filepath))
-
-            if loaded.dim() != 3:
-                raise ValueError(
-                    'Offline BEV feature must be a single-frame tensor [1, HW, C], got {} from {}'.format(
-                        tuple(loaded.shape), filepath)
-                )
-            if loaded.shape[0] != 1:
-                raise ValueError(
-                    'Legacy multi-frame offline BEV is no longer supported. '
-                    'Expected [1, HW, C], got {} from {}'.format(tuple(loaded.shape), filepath)
-                )
-
-            batch_bev.append(loaded)
-
-        bev_seq = torch.stack(batch_bev, dim=0).to(device=device)
+        bev_seq = torch.cat(batch_bev, dim=0).to(device=device)
         return self._uniform_temporal_length(bev_seq)
 
     def _uniform_temporal_length(self, bev_seq):
@@ -694,27 +694,33 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         for b, sample_metas in enumerate(temporal_metas):
             frame_bev = []
             frame_keys = list(sample_metas.keys())
-            for t_idx, frame_key in enumerate(frame_keys):
-                frame_img = img[b:b + 1, t_idx, ...]
-                frame_meta = [sample_metas[frame_key]]
-                if not isinstance(frame_meta[0], dict):
+            frame_metas = [sample_metas[k] for k in frame_keys]
+            for frame_meta in frame_metas:
+                if not isinstance(frame_meta, dict):
                     raise TypeError('frame_meta must be a single-frame dict.')
-                if any(isinstance(k, int) for k in frame_meta[0].keys()):
+                if any(isinstance(k, int) for k in frame_meta.keys()):
                     raise ValueError(
                         'Temporal img_metas dict was passed into single-frame BEV extraction. '
                         'Expected per-frame metadata only.'
                     )
-                with torch.no_grad():
-                    # BEVFormer is frozen and used as feature extractor only.
-                    # Keep this branch in FP32 to avoid nearest2d BF16 errors
-                    # on torch builds without BF16 upsample support.
-                    with self._bevformer_safe_context():
-                        img_feats = self.extract_feat(img=frame_img.float(), img_metas=frame_meta)
-                        if self.num_levels:
-                            img_feats = img_feats[:self.num_levels]
+
+            frame_imgs = img[b, :len(frame_keys), ...]
+            with torch.no_grad():
+                # BEVFormer is frozen and used as feature extractor only.
+                # Keep this branch in FP32 to avoid nearest2d BF16 errors
+                # on torch builds without BF16 upsample support.
+                with self._bevformer_safe_context():
+                    # Run backbone/neck once for all timesteps in this sample
+                    # to avoid per-frame repeated feature extraction overhead.
+                    img_feats_all = self.extract_feat(img=frame_imgs.float(), img_metas=frame_metas)
+                    if self.num_levels:
+                        img_feats_all = img_feats_all[:self.num_levels]
+
+                    for t_idx, frame_meta in enumerate(frame_metas):
+                        per_frame_feats = [feat[t_idx:t_idx + 1, ...] for feat in img_feats_all]
                         # only_bev=True returns dense BEV tokens of shape [1, HW, C].
-                        bev = self.pts_bbox_head(img_feats, frame_meta, None, only_bev=True)
-                frame_bev.append(bev)
+                        bev = self.pts_bbox_head(per_frame_feats, [frame_meta], None, only_bev=True)
+                        frame_bev.append(bev)
             frame_bev = torch.stack(frame_bev, dim=1)  # [1, T, HW, C]
             batch_bev.append(frame_bev)
         bev_seq = torch.cat(batch_bev, dim=0)  # [B, T, HW, C]

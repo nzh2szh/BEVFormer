@@ -257,70 +257,105 @@ date: 202606181028
 
 --------------------------------------------------------------------------------------------------------
 
+date: 202606181028
+
+修改：
+
+修复离线 train/infer/validate 的读取方式：
+现在按 scene_token + frame_nbr 回溯历史帧构建时序片段，不再只读当前帧再硬补到 40。
+关键位置：
+bevformerv2_debertav3_align.py:609
+bevformerv2_debertav3_align.py:612
+
+优化离线 extract 的抽特征路径：
+原来每个时间步单独跑一次 backbone；现在每个样本把整段时间帧一次性过 backbone/neck，再按时间步取特征做 BEV。
+关键位置：
+bevformerv2_debertav3_align.py:713
+bevformerv2_debertav3_align.py:715
+
+说明：
+
+我保留了“场景起始处帧数不足时的补齐”机制（仍是 pad 逻辑），但不再是“所有离线样本都只有 1 帧然后复制到 40”。
+这次改动已做文件级错误检查，当前无静态报错。
+
+--------------------------------------------------------------------------------------------------------
+
 COMMAND:
 
 offline_extract_bev:
 
 mini train split 导出（写入 train 目录）:
+[ -d data/nuscenes/v1.0-trainval ] || ln -s v1.0-mini data/nuscenes/v1.0-trainval
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
 python tools/train.py \
-  configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
-  --no-validate \
-  --cfg-options \
-  model.run_mode=offline_extract_bev \
-  model.offline_split=train \
-  model.scene_json=data/nuscenes/v1.0-mini/scene.json \
-  data.train.ann_file=data/nuscenes/nuscenes_infos_temporal_train.pkl \
-  data.samples_per_gpu=1 \
-  data.workers_per_gpu=0 \
-  total_epochs=1 \
-  runner.max_epochs=1
+configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
+--no-validate \
+--cfg-options \
+model.run_mode=offline_extract_bev \
+model.offline_split=train \
+model.scene_json=data/nuscenes/v1.0-mini/scene.json \
+model.frames="(0,)" \
+data.train.frames="(0,)" \
+data.train.ann_file=data/nuscenes/nuscenes_infos_temporal_train.pkl \
+data.train.mono_cfg=None \
+data.samples_per_gpu=1 \
+data.workers_per_gpu=8 \
+total_epochs=1 \
+runner.max_epochs=1
 
 mini val split 导出（写入 val 目录）:
+[ -d data/nuscenes/v1.0-trainval ] || ln -s v1.0-mini data/nuscenes/v1.0-trainval
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
 python tools/train.py \
-  configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
-  --no-validate \
-  --cfg-options \
-  model.run_mode=offline_extract_bev \
-  model.offline_split=val \
-  model.scene_json=data/nuscenes/v1.0-mini/scene.json \
-  data.val.ann_file=data/nuscenes/nuscenes_infos_temporal_val.pkl \
-  data.samples_per_gpu=1 \
-  data.workers_per_gpu=0 \
-  total_epochs=1 \
-  runner.max_epochs=1
-
-offline validate（默认读 val 目录）:
-python tools/validate_vlm_align.py \
-  configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
-  --base-ckpt ./ckpts/epoch_24.pth \
-  --align-ckpt work_dirs/xxx/align_trainable_epoch_12.pth \
-  --cfg-options model.run_mode=offline_infer_validate
+configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
+--no-validate \
+--cfg-options \
+model.run_mode=offline_extract_bev \
+model.offline_split=val \
+model.scene_json=data/nuscenes/v1.0-mini/scene.json \
+model.frames="(0,)" \
+data.val.frames="(0,)" \
+data.val.ann_file=data/nuscenes/nuscenes_infos_temporal_val.pkl \
+data.train.mono_cfg=None \
+data.samples_per_gpu=1 \
+data.workers_per_gpu=8 \
+total_epochs=1 \
+runner.max_epochs=1
 
 full dataset train split 导出（写入 train 目录）:
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
 python tools/train.py \
-  configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
-  --no-validate \
-  --cfg-options \
-  model.run_mode=offline_extract_bev \
-  model.offline_split=train \
-  model.scene_json=data/nuscenes/v1.0-trainval/scene.json \
-  data.train.ann_file=data/nuscenes/nuscenes_infos_temporal_train.pkl \
-  data.samples_per_gpu=1 \
-  total_epochs=1 \
-  runner.max_epochs=1
+configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
+--no-validate \
+--cfg-options \
+model.run_mode=offline_extract_bev \
+model.offline_split=train \
+model.scene_json=data/nuscenes/v1.0-trainval/scene.json \
+model.frames="(0,)" \
+data.train.frames="(0,)" \
+data.train.ann_file=data/nuscenes/nuscenes_infos_temporal_train.pkl \
+data.train.mono_cfg=None \
+data.samples_per_gpu=1 \
+data.workers_per_gpu=8 \
+total_epochs=1 \
+runner.max_epochs=1
 
 full dataset val split 导出（写入 val 目录）:
 python tools/train.py \
-  configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
-  --no-validate \
-  --cfg-options \
-  model.run_mode=offline_extract_bev \
-  model.offline_split=val \
-  model.scene_json=data/nuscenes/v1.0-trainval/scene.json \
-  data.val.ann_file=data/nuscenes/nuscenes_infos_temporal_val.pkl \
-  data.samples_per_gpu=1 \
-  total_epochs=1 \
-  runner.max_epochs=1
+configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
+--no-validate \
+--cfg-options \
+model.run_mode=offline_extract_bev \
+model.offline_split=val \
+model.scene_json=data/nuscenes/v1.0-trainval/scene.json \
+model.frames="(0,)" \
+data.val.frames="(0,)" \
+data.val.ann_file=data/nuscenes/nuscenes_infos_temporal_val.pkl \
+data.val.mono_cfg=None \
+data.samples_per_gpu=1 \
+data.workers_per_gpu=8 \
+total_epochs=1 \
+runner.max_epochs=1
 
 说明：
 offline_extract_bev 会被内部映射到 extract，只做 BEV 特征导出。

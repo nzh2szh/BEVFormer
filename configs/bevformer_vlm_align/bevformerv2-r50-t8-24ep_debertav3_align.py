@@ -58,7 +58,8 @@ load_from = './ckpts/epoch_24.pth'
 
 # Raise batch size as much as memory allows to improve in-batch negatives.
 data = dict(
-    samples_per_gpu=8,
+    # Single-GPU online mode with 40 frames is memory-heavy; keep batch=1 by default.
+    samples_per_gpu=1,
     workers_per_gpu=4,
     train=dict(frames=frames),
     val=dict(frames=frames),
