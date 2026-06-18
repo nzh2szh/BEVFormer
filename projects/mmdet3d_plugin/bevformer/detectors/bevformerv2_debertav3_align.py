@@ -4,6 +4,7 @@ import os
 import secrets
 import warnings
 from collections import OrderedDict
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -59,6 +60,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                  spatial_bev_h=200,
                  spatial_bev_w=200,
                  gather_ddp=True,
+                 use_bf16_amp=True,
                  run_mode='online',
                  offline_bev_dir='',
                  offline_bev_dir_by_split=None,
@@ -146,6 +148,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         self.spatial_bev_h = spatial_bev_h
         self.spatial_bev_w = spatial_bev_w
         self.gather_ddp = gather_ddp
+        self.use_bf16_amp = use_bf16_amp
         self.run_mode = run_mode
         self.offline_bev_dir = offline_bev_dir
         self.offline_bev_dir_by_split = offline_bev_dir_by_split or {}
@@ -240,6 +243,20 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         self.scene_token_to_name = self._load_scene_name_map()
         self.scene_sample_order = self._load_scene_sample_order_map()
         self._freeze_visual_backbone()
+        # Keep all module weights in native FP32. AMP autocast controls runtime
+        # precision and automatically falls back for unsupported BF16 operators.
+
+    def _amp_autocast_context(self):
+        """Return BF16 autocast context when CUDA runtime is available."""
+        if self.use_bf16_amp and torch.cuda.is_available():
+            return torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        return nullcontext()
+
+    def _bevformer_safe_context(self):
+        """Run BEVFormer extraction in FP32 to bypass unsupported BF16 ops."""
+        if self.use_bf16_amp and torch.cuda.is_available():
+            return torch.cuda.amp.autocast(enabled=False)
+        return nullcontext()
 
     def _freeze_module(self, module):
         """Freeze a module and force eval mode."""
@@ -549,6 +566,10 @@ class BEVFormerDebertaAlign(BEVFormerV2):
             if (not os.path.isfile(filepath)) or self.offline_dump_overwrite:
                 # Dump one BEV frame [1, HW, C] by exact anchor frame index.
                 single_bev = bev_seq[b, anchor_idx:anchor_idx + 1, :, :].detach().cpu()
+                if self.use_bf16_amp:
+                    # Keep runtime extraction stable in FP32, but store offline
+                    # features in BF16 to reduce disk size and I/O.
+                    single_bev = single_bev.to(torch.bfloat16)
                 torch.save(single_bev, filepath)
 
             key = '{}::{}'.format(scene_token, int(frame_nbr))
@@ -685,11 +706,14 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                     )
                 with torch.no_grad():
                     # BEVFormer is frozen and used as feature extractor only.
-                    img_feats = self.extract_feat(img=frame_img, img_metas=frame_meta)
-                    if self.num_levels:
-                        img_feats = img_feats[:self.num_levels]
-                    # only_bev=True returns dense BEV tokens of shape [1, HW, C].
-                    bev = self.pts_bbox_head(img_feats, frame_meta, None, only_bev=True)
+                    # Keep this branch in FP32 to avoid nearest2d BF16 errors
+                    # on torch builds without BF16 upsample support.
+                    with self._bevformer_safe_context():
+                        img_feats = self.extract_feat(img=frame_img.float(), img_metas=frame_meta)
+                        if self.num_levels:
+                            img_feats = img_feats[:self.num_levels]
+                        # only_bev=True returns dense BEV tokens of shape [1, HW, C].
+                        bev = self.pts_bbox_head(img_feats, frame_meta, None, only_bev=True)
                 frame_bev.append(bev)
             frame_bev = torch.stack(frame_bev, dim=1)  # [1, T, HW, C]
             batch_bev.append(frame_bev)
@@ -870,30 +894,31 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         if img_metas is None:
             raise ValueError('img_metas is required for BEVFormerDebertaAlign.')
 
-        if self.run_mode == 'offline_train':
-            bev_seq = self._load_offline_bev_sequence(img_metas, device=img.device)
-        else:
-            bev_seq = self._extract_bev_sequence(img, img_metas)
+        with self._amp_autocast_context():
+            if self.run_mode == 'offline_train':
+                bev_seq = self._load_offline_bev_sequence(img_metas, device=img.device)
+            else:
+                bev_seq = self._extract_bev_sequence(img, img_metas)
 
-        if self.run_mode == 'extract':
-            self._dump_bev_features(bev_seq, img_metas)
-            # Keep training loop compatible while skipping optimization target.
-            # Use an explicit grad-enabled scalar to avoid backward failure
-            # when bev_seq is produced under no_grad in extract mode.
-            return {
-                'loss_align': torch.zeros((), device=bev_seq.device, requires_grad=True),
-                'acc_i2t_top1': bev_seq.new_tensor(0.0),
-                'acc_t2i_top1': bev_seq.new_tensor(0.0),
-            }
+            if self.run_mode == 'extract':
+                self._dump_bev_features(bev_seq, img_metas)
+                # Keep training loop compatible while skipping optimization target.
+                # Use an explicit grad-enabled scalar to avoid backward failure
+                # when bev_seq is produced under no_grad in extract mode.
+                return {
+                    'loss_align': torch.zeros((), device=bev_seq.device, requires_grad=True),
+                    'acc_i2t_top1': bev_seq.new_tensor(0.0),
+                    'acc_t2i_top1': bev_seq.new_tensor(0.0),
+                }
 
-        vision_feat = self._encode_vision(bev_seq)
-        texts = self._resolve_scene_text(img_metas, scene_text=scene_text)
-        text_feat = self._encode_text(texts, device=img.device)
-        loss, i2t_top1, t2i_top1, _ = self._contrastive_loss(
-            vision_feat,
-            text_feat,
-            gather_ddp=self.gather_ddp,
-        )
+            vision_feat = self._encode_vision(bev_seq)
+            texts = self._resolve_scene_text(img_metas, scene_text=scene_text)
+            text_feat = self._encode_text(texts, device=img.device)
+            loss, i2t_top1, t2i_top1, _ = self._contrastive_loss(
+                vision_feat,
+                text_feat,
+                gather_ddp=self.gather_ddp,
+            )
 
         return {
             'loss_align': loss,
@@ -910,23 +935,24 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         if img is None:
             raise ValueError('img is required for BEVFormerDebertaAlign.')
 
-        if self.run_mode in {'offline_infer', 'offline_infer_validate'}:
-            bev_seq = self._load_offline_bev_sequence(img_metas, device=img.device)
-        else:
-            bev_seq = self._extract_bev_sequence(img, img_metas)
+        with self._amp_autocast_context():
+            if self.run_mode in {'offline_infer', 'offline_infer_validate'}:
+                bev_seq = self._load_offline_bev_sequence(img_metas, device=img.device)
+            else:
+                bev_seq = self._extract_bev_sequence(img, img_metas)
 
-        if self.run_mode == 'extract':
-            self._dump_bev_features(bev_seq, img_metas)
-            return [{'extract_saved': True} for _ in range(bev_seq.shape[0])]
+            if self.run_mode == 'extract':
+                self._dump_bev_features(bev_seq, img_metas)
+                return [{'extract_saved': True} for _ in range(bev_seq.shape[0])]
 
-        vision_feat = self._encode_vision(bev_seq)
-        texts = self._resolve_scene_text(img_metas, scene_text=scene_text)
-        text_feat = self._encode_text(texts, device=img.device)
-        _, i2t_top1, t2i_top1, logits = self._contrastive_loss(
-            vision_feat,
-            text_feat,
-            gather_ddp=False,
-        )
+            vision_feat = self._encode_vision(bev_seq)
+            texts = self._resolve_scene_text(img_metas, scene_text=scene_text)
+            text_feat = self._encode_text(texts, device=img.device)
+            _, i2t_top1, t2i_top1, logits = self._contrastive_loss(
+                vision_feat,
+                text_feat,
+                gather_ddp=False,
+            )
 
         results = []
         for i in range(logits.shape[0]):

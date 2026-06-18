@@ -44,6 +44,8 @@ model = dict(
     spatial_bev_h=200,
     spatial_bev_w=200,
     gather_ddp=True,
+    # Enable BF16 runtime for frozen backbones and alignment head.
+    use_bf16_amp=True,
     dropout=0.1,
     temperature=0.07,
 )
