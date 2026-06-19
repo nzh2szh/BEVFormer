@@ -14,14 +14,56 @@ from projects.mmdet3d_plugin.dd3d.datasets.nuscenes import NuscenesDataset as DD
 
 @DATASETS.register_module()
 class CustomNuScenesDatasetV2(NuScenesDataset):
-    def __init__(self, frames=(),mono_cfg=None, overlap_test=False,*args, **kwargs):
+    def __init__(self, frames=(),mono_cfg=None, overlap_test=False, offline_meta_only=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.frames = frames
         self.queue_length = len(frames)
         self.overlap_test = overlap_test
         self.mono_cfg = mono_cfg
+        self.offline_meta_only = offline_meta_only
         if not self.test_mode and mono_cfg is not None:
             self.mono_dataset = DD3DNuscenesDataset(**mono_cfg)
+
+    def _prepare_offline_meta_only(self, index):
+        """Build temporal metadata queue without loading images.
+
+        This mode is intended for offline_* workflows where model inputs are
+        loaded from dumped BEV features instead of camera images.
+        """
+        if index < 0 or index >= len(self.data_infos):
+            return None
+
+        cur_info = self.data_infos[index]
+        cur_meta = self.prepare_input_dict(cur_info)
+        cur_scene_token = cur_meta['scene_token']
+
+        data_queue = OrderedDict()
+        data_queue[0] = cur_meta
+
+        for frame_idx in self.frames:
+            chosen_idx = index + frame_idx
+            if frame_idx == 0 or chosen_idx < 0 or chosen_idx >= len(self.data_infos):
+                continue
+            info = self.data_infos[chosen_idx]
+            sample_meta = self.prepare_input_dict(info)
+            if sample_meta['scene_token'] == cur_scene_token:
+                data_queue[frame_idx] = sample_meta
+
+        data_queue = OrderedDict(sorted(data_queue.items()))
+
+        # Keep temporal length fixed for deterministic downstream behavior.
+        ordered_queue = OrderedDict(sorted(data_queue.items()))
+        first_sample = next(iter(ordered_queue.values()))
+        filled_queue = OrderedDict()
+        last_sample = first_sample
+        for frame_idx in sorted(self.frames):
+            if frame_idx in ordered_queue:
+                last_sample = ordered_queue[frame_idx]
+                filled_queue[frame_idx] = copy.deepcopy(last_sample)
+            else:
+                filled_queue[frame_idx] = copy.deepcopy(last_sample)
+
+        return dict(img_metas=DC(filled_queue, cpu_only=True))
 
     def prepare_test_data(self, index):
         """Prepare data for testing.
@@ -32,6 +74,9 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
         Returns:
             dict: Testing data dict of the corresponding index.
         """
+        if self.offline_meta_only:
+            return self._prepare_offline_meta_only(index)
+
         data_queue = OrderedDict()
         input_dict = self.get_data_info(index)
         cur_scene_token = input_dict['scene_token']
@@ -74,6 +119,9 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
         Returns:
             dict: Training data dict of the corresponding index.
         """
+        if self.offline_meta_only:
+            return self._prepare_offline_meta_only(index)
+
         data_queue = OrderedDict()
         input_dict = self.get_data_info(index)
         if input_dict is None:
@@ -131,6 +179,22 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
         """
         convert sample queue into one single sample.
         """
+        # Keep a fixed temporal length for every sample. Scene boundaries may
+        # miss early history frames; forward-fill them with the nearest
+        # available previous frame to keep tensor shapes consistent.
+        if len(self.frames) > 0:
+            ordered_queue = OrderedDict(sorted(queue.items()))
+            first_sample = next(iter(ordered_queue.values()))
+            filled_queue = OrderedDict()
+            last_sample = first_sample
+            for frame_idx in sorted(self.frames):
+                if frame_idx in ordered_queue:
+                    last_sample = ordered_queue[frame_idx]
+                    filled_queue[frame_idx] = last_sample
+                else:
+                    filled_queue[frame_idx] = copy.deepcopy(last_sample)
+            queue = filled_queue
+
         imgs_list = []
         for each in queue.values():
             img_field = each['img']

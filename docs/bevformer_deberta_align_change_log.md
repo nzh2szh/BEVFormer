@@ -280,6 +280,73 @@ bevformerv2_debertav3_align.py:715
 
 --------------------------------------------------------------------------------------------------------
 
+date: 202606192215
+
+offline trian补未来帧是按真实 meta 索引去补的，不是简单把 1 帧复制成多帧。
+
+当前实现流程是：
+先从 bev_feature.json 建 scene -> 可用 frame_nbr 列表
+见 bevformerv2_debertav3_align.py:542 和 bevformerv2_debertav3_align.py:544
+
+选窗口时用 past_then_future 策略
+先拿历史，不够再补同一 scene 的后续真实 frame_nbr
+见 bevformerv2_debertav3_align.py:549 和 bevformerv2_debertav3_align.py:564
+
+对选出的每个 frame_nbr 逐个加载对应 pth
+见 bevformerv2_debertav3_align.py:662 和 bevformerv2_debertav3_align.py:675
+
+只有最后兜底这一步，才会在仍不足 expected_frames 时复制最后一帧做 pad（通常发生在该 scene 总帧数本来就不足时）。
+
+
+
+anchor 的定义
+anchor 不是场景第一帧，也不是场景最后一帧。
+anchor 是当前样本里的“当前时刻帧”，也就是时间键 0 对应的那一帧。
+
+为什么是键 0
+数据集在组时间队列时先放当前样本到键 0，再补历史帧，然后整体排序。
+见 nuscenes_dataset_v2.py:91
+见 nuscenes_dataset_v2.py:95
+见 nuscenes_dataset_v2.py:110
+
+模型里如何取 anchor
+模型优先取键 0 作为 anchor；若异常缺失才退化到最大键。
+见 bevformerv2_debertav3_align.py:436
+见 bevformerv2_debertav3_align.py:442
+
+在各模式下的作用
+
+online 或 origin
+作用：决定本样本的当前时刻，用于组织时序输入和文本对齐目标。
+走在线提特征路径。
+见 bevformerv2_debertav3_align.py:958
+配置默认帧范围是 -39 到 0。
+见 bevformerv2-r50-t8-24ep_debertav3_align.py:7
+
+extract 或 offline_extract_bev
+作用：用 anchor 定位“当前帧应落盘的那一条离线特征”。
+即每个样本按 anchor 导出一帧 pth，并写入对应 frame_nbr 的 metadata。
+见 bevformerv2_debertav3_align.py:574
+见 bevformerv2_debertav3_align.py:593
+
+offline_train
+作用：用 anchor 先映射到 frame_nbr，再围绕该 frame_nbr 组一段离线时序 clip。
+现在是历史优先，不足时可补同场景未来真实帧，再最终统一长度。
+见 bevformerv2_debertav3_align.py:955
+见 bevformerv2_debertav3_align.py:654
+见 bevformerv2_debertav3_align.py:659
+
+offline_infer 和 offline_infer_validate
+作用和 offline_train 一样，anchor 仍是当前样本时刻，只是用于推理或验证分支。
+见 bevformerv2_debertav3_align.py:996
+见 bevformerv2_debertav3_align.py:997
+
+一句话总结
+anchor 的本质是“这个样本的当前帧基准点”。
+extract 用它决定导出哪一帧；offline 模式用它决定从哪一帧向前或向前后组时序。
+
+--------------------------------------------------------------------------------------------------------
+
 COMMAND:
 
 offline_extract_bev:
@@ -356,6 +423,26 @@ data.samples_per_gpu=1 \
 data.workers_per_gpu=8 \
 total_epochs=1 \
 runner.max_epochs=1
+
+offline train:
+
+mini:
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
+python tools/train.py \
+configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
+--no-validate \
+--cfg-options \
+model.run_mode=offline_train \
+model.offline_split=train \
+model.scene_json=data/nuscenes/v1.0-mini/scene.json \
+data.train.ann_file=data/nuscenes/nuscenes_infos_temporal_train.pkl \
+data.train.mono_cfg=None \
+data.train.offline_meta_only=True \
+data.samples_per_gpu=2 \
+data.workers_per_gpu=2 \
+data.persistent_workers=False \
+data.prefetch_factor=1
+
 
 说明：
 offline_extract_bev 会被内部映射到 extract，只做 BEV 特征导出。

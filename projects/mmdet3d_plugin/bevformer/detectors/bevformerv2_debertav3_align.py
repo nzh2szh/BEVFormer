@@ -1,4 +1,5 @@
 import json
+import bisect
 import math
 import os
 import secrets
@@ -67,6 +68,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                  offline_split=None,
                  offline_metadata_name='bev_feature.json',
                  offline_dump_overwrite=False,
+                 offline_sequence_mode='past_then_future',
                  **kwargs):
         """Initialize BEVFormer-DeBERTa alignment model.
 
@@ -129,6 +131,12 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                                 offline_bev_dir.
                         offline_dump_overwrite (bool): Whether overwrite existed pth/json
                                 when dumping BEV features in extract mode.
+                        offline_sequence_mode (str): Policy for building
+                            offline temporal clips.
+                            - past_only: use only frames <= anchor.
+                            - past_then_future: use past first; if shorter
+                              than expected_frames, append later frames in
+                              the same scene before final padding.
             **kwargs: Remaining BEVFormerV2 initialization arguments.
         """
         super().__init__(**kwargs)
@@ -155,6 +163,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         self.offline_split = offline_split
         self.offline_metadata_name = offline_metadata_name
         self.offline_dump_overwrite = offline_dump_overwrite
+        self.offline_sequence_mode = offline_sequence_mode
 
         mode_alias = {
             'origin': 'online',
@@ -176,6 +185,13 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                     sorted(self._valid_run_modes),
                 )
             )
+        if self.offline_sequence_mode not in {'past_only', 'past_then_future'}:
+            raise ValueError(
+                'Unsupported offline_sequence_mode: {}. valid values are {}.'.format(
+                    self.offline_sequence_mode,
+                    ['past_only', 'past_then_future'],
+                )
+            )
 
         if not isinstance(self.offline_bev_dir_by_split, dict):
             raise TypeError('offline_bev_dir_by_split must be a dict when provided.')
@@ -184,6 +200,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
 
         self._offline_records = []
         self._offline_record_index = {}
+        self._offline_scene_frames = {}
         if self.run_mode in {'offline_train', 'offline_infer', 'offline_infer_validate'}:
             self._load_offline_bev_index()
 
@@ -507,6 +524,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
 
         self._offline_records = records
         self._offline_record_index = {}
+        scene_frame_set = {}
         for rec in records:
             if not isinstance(rec, dict):
                 continue
@@ -519,6 +537,39 @@ class BEVFormerDebertaAlign(BEVFormerV2):
             except (TypeError, ValueError):
                 continue
             self._offline_record_index[key] = rec
+            if scene_token not in scene_frame_set:
+                scene_frame_set[scene_token] = set()
+            scene_frame_set[scene_token].add(int(frame_nbr))
+
+        self._offline_scene_frames = {
+            scene: sorted(frame_set)
+            for scene, frame_set in scene_frame_set.items()
+        }
+
+    def _select_offline_frame_numbers(self, scene_token, anchor_frame_nbr):
+        """Select ordered frame numbers for one offline temporal clip."""
+        scene_frames = self._offline_scene_frames.get(scene_token, [])
+        if len(scene_frames) == 0:
+            return []
+
+        anchor = int(anchor_frame_nbr)
+        end = bisect.bisect_right(scene_frames, anchor)
+        if end <= 0:
+            end = 1
+
+        if self.offline_sequence_mode == 'past_only':
+            start = max(0, end - self.expected_frames)
+            return scene_frames[start:end]
+
+        # past_then_future: keep history priority, then append newer frames
+        # when history is short at early scene anchors.
+        start = max(0, end - self.expected_frames)
+        if end - start < self.expected_frames:
+            need = self.expected_frames - (end - start)
+            end = min(len(scene_frames), end + need)
+        if end - start > self.expected_frames:
+            start = end - self.expected_frames
+        return scene_frames[start:end]
 
     def _dump_bev_features(self, bev_seq, img_metas):
         """Dump each sample BEV feature to pth and update bev_feature.json."""
@@ -606,12 +657,9 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         batch_bev = []
         for sample_metas in temporal_metas:
             scene_token, frame_nbr, _ = self._get_scene_token_and_group(sample_metas)
-            # Build a temporal clip by tracing historical frame_nbr values.
-            # This avoids the previous behavior that loaded only the anchor
-            # frame and then repeated it to expected_frames.
-            clip_start = max(0, int(frame_nbr) - self.expected_frames + 1)
+            frame_numbers = self._select_offline_frame_numbers(scene_token, frame_nbr)
             clip_frames = []
-            for hist_nbr in range(clip_start, int(frame_nbr) + 1):
+            for hist_nbr in frame_numbers:
                 key = '{}::{}'.format(scene_token, hist_nbr)
                 record = self._offline_record_index.get(key)
                 if record is None:
@@ -657,10 +705,13 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 )
 
             sample_bev = torch.cat(clip_frames, dim=0).unsqueeze(0)
+            # Normalize each sample first so batch concat never sees
+            # different temporal lengths across samples.
+            sample_bev = self._uniform_temporal_length(sample_bev)
             batch_bev.append(sample_bev)
 
         bev_seq = torch.cat(batch_bev, dim=0).to(device=device)
-        return self._uniform_temporal_length(bev_seq)
+        return bev_seq
 
     def _uniform_temporal_length(self, bev_seq):
         """Resize temporal length to expected_frames by sample/pad.
@@ -895,14 +946,17 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         Expects temporal multi-camera image clip and scene-level text target.
         Returns MMDetection-style loss dict.
         """
-        if img is None:
-            raise ValueError('img is required for BEVFormerDebertaAlign.')
+        offline_mode = self.run_mode == 'offline_train'
+        if img is None and not offline_mode:
+            raise ValueError('img is required for BEVFormerDebertaAlign in non-offline mode.')
         if img_metas is None:
             raise ValueError('img_metas is required for BEVFormerDebertaAlign.')
 
+        device = img.device if img is not None else self.logit_scale.device
+
         with self._amp_autocast_context():
-            if self.run_mode == 'offline_train':
-                bev_seq = self._load_offline_bev_sequence(img_metas, device=img.device)
+            if offline_mode:
+                bev_seq = self._load_offline_bev_sequence(img_metas, device=device)
             else:
                 bev_seq = self._extract_bev_sequence(img, img_metas)
 
@@ -919,7 +973,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
 
             vision_feat = self._encode_vision(bev_seq)
             texts = self._resolve_scene_text(img_metas, scene_text=scene_text)
-            text_feat = self._encode_text(texts, device=img.device)
+            text_feat = self._encode_text(texts, device=device)
             loss, i2t_top1, t2i_top1, _ = self._contrastive_loss(
                 vision_feat,
                 text_feat,
@@ -938,12 +992,15 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         Returns per-sample top-1 prediction and batch-level retrieval accuracy
         computed within current inference batch.
         """
-        if img is None:
-            raise ValueError('img is required for BEVFormerDebertaAlign.')
+        offline_mode = self.run_mode in {'offline_infer', 'offline_infer_validate'}
+        if img is None and not offline_mode:
+            raise ValueError('img is required for BEVFormerDebertaAlign in non-offline mode.')
+
+        device = img.device if img is not None else self.logit_scale.device
 
         with self._amp_autocast_context():
-            if self.run_mode in {'offline_infer', 'offline_infer_validate'}:
-                bev_seq = self._load_offline_bev_sequence(img_metas, device=img.device)
+            if offline_mode:
+                bev_seq = self._load_offline_bev_sequence(img_metas, device=device)
             else:
                 bev_seq = self._extract_bev_sequence(img, img_metas)
 
@@ -953,7 +1010,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
 
             vision_feat = self._encode_vision(bev_seq)
             texts = self._resolve_scene_text(img_metas, scene_text=scene_text)
-            text_feat = self._encode_text(texts, device=img.device)
+            text_feat = self._encode_text(texts, device=device)
             _, i2t_top1, t2i_top1, logits = self._contrastive_loss(
                 vision_feat,
                 text_feat,
