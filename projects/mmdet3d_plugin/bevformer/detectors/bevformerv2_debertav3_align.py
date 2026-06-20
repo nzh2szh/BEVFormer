@@ -657,7 +657,12 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         batch_bev = []
         for sample_metas in temporal_metas:
             scene_token, frame_nbr, _ = self._get_scene_token_and_group(sample_metas)
-            frame_numbers = self._select_offline_frame_numbers(scene_token, frame_nbr)
+            anchor_meta = self._get_anchor_meta(sample_metas)
+            explicit_frame_nbrs = anchor_meta.get('offline_frame_nbrs', None)
+            if isinstance(explicit_frame_nbrs, (list, tuple)) and len(explicit_frame_nbrs) > 0:
+                frame_numbers = [int(x) for x in explicit_frame_nbrs]
+            else:
+                frame_numbers = self._select_offline_frame_numbers(scene_token, frame_nbr)
             clip_frames = []
             for hist_nbr in frame_numbers:
                 key = '{}::{}'.format(scene_token, hist_nbr)
@@ -1011,7 +1016,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
             vision_feat = self._encode_vision(bev_seq)
             texts = self._resolve_scene_text(img_metas, scene_text=scene_text)
             text_feat = self._encode_text(texts, device=device)
-            _, i2t_top1, t2i_top1, logits = self._contrastive_loss(
+            loss_align, i2t_top1, t2i_top1, logits = self._contrastive_loss(
                 vision_feat,
                 text_feat,
                 gather_ddp=False,
@@ -1022,6 +1027,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
             results.append({
                 'i2t_top1': int(logits[i].argmax().item()),
                 'i2t_score': float(logits[i].max().item()),
+                'loss_align': float(loss_align.item()),
                 'acc_i2t_top1': float(i2t_top1.item()),
                 'acc_t2i_top1': float(t2i_top1.item()),
                 'scene_text': texts[i],

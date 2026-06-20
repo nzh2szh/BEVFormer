@@ -14,15 +14,59 @@ from projects.mmdet3d_plugin.dd3d.datasets.nuscenes import NuscenesDataset as DD
 
 @DATASETS.register_module()
 class CustomNuScenesDatasetV2(NuScenesDataset):
-    def __init__(self, frames=(),mono_cfg=None, overlap_test=False, offline_meta_only=False, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self,
+                 frames=(),
+                 mono_cfg=None,
+                 overlap_test=False,
+                 offline_meta_only=False,
+                 offline_unique_anchor=False,
+                 offline_drop_last_chunk=False,
+                 *args,
+                 **kwargs):
+        # Set custom flags before parent init since parent construction may
+        # trigger methods (e.g., __len__) that access these fields.
         self.frames = frames
         self.queue_length = len(frames)
         self.overlap_test = overlap_test
         self.mono_cfg = mono_cfg
         self.offline_meta_only = offline_meta_only
+        self.offline_unique_anchor = offline_unique_anchor
+        self.offline_drop_last_chunk = offline_drop_last_chunk
+        self._offline_chunks = None
+
+        super().__init__(*args, **kwargs)
+
+        if self.offline_meta_only and self.offline_unique_anchor:
+            self._offline_chunks = self._build_offline_chunks()
         if not self.test_mode and mono_cfg is not None:
             self.mono_dataset = DD3DNuscenesDataset(**mono_cfg)
+
+    def _build_offline_chunks(self):
+        """Build non-overlap chunks so each frame is used once per epoch."""
+        if self.queue_length <= 0:
+            raise ValueError('frames must be non-empty when offline_unique_anchor=True')
+
+        by_scene = defaultdict(list)
+        for idx, info in enumerate(self.data_infos):
+            by_scene[info['scene_token']].append((int(info['frame_idx']), idx))
+
+        chunks = []
+        for scene_token, items in by_scene.items():
+            items.sort(key=lambda x: x[0])
+            ordered_indices = [idx for _, idx in items]
+            for start in range(0, len(ordered_indices), self.queue_length):
+                chunk = ordered_indices[start:start + self.queue_length]
+                if len(chunk) < self.queue_length and self.offline_drop_last_chunk:
+                    continue
+                chunks.append((scene_token, chunk))
+        return chunks
+
+    def __len__(self):
+        if (getattr(self, 'offline_meta_only', False)
+                and getattr(self, 'offline_unique_anchor', False)
+                and getattr(self, '_offline_chunks', None) is not None):
+            return len(self._offline_chunks)
+        return super().__len__()
 
     def _prepare_offline_meta_only(self, index):
         """Build temporal metadata queue without loading images.
@@ -30,6 +74,32 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
         This mode is intended for offline_* workflows where model inputs are
         loaded from dumped BEV features instead of camera images.
         """
+        if self.offline_unique_anchor and self._offline_chunks is not None:
+            if index < 0 or index >= len(self._offline_chunks):
+                return None
+            _, chunk_indices = self._offline_chunks[index]
+            if len(chunk_indices) == 0:
+                return None
+
+            # Pad tail chunk by repeating its last frame index so temporal
+            # length stays fixed while still avoiding cross-chunk overlap.
+            if len(chunk_indices) < self.queue_length:
+                chunk_indices = list(chunk_indices) + [chunk_indices[-1]] * (self.queue_length - len(chunk_indices))
+
+            frame_keys = sorted(self.frames)
+            filled_queue = OrderedDict()
+            frame_nbrs = []
+            for key, info_idx in zip(frame_keys, chunk_indices):
+                meta = self.prepare_input_dict(self.data_infos[info_idx])
+                frame_nbrs.append(int(meta['frame_idx']))
+                filled_queue[key] = meta
+
+            # Store explicit frame list on anchor meta so detector can load
+            # this exact non-overlap chunk instead of building sliding windows.
+            anchor_key = 0 if 0 in filled_queue else max(filled_queue.keys())
+            filled_queue[anchor_key]['offline_frame_nbrs'] = frame_nbrs
+            return dict(img_metas=DC(filled_queue, cpu_only=True))
+
         if index < 0 or index >= len(self.data_infos):
             return None
 

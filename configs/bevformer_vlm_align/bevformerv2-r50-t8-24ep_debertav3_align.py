@@ -65,7 +65,15 @@ data = dict(
     workers_per_gpu=2,
     persistent_workers=False,
     prefetch_factor=1,
-    train=dict(frames=frames),
+    train=dict(
+        frames=frames,
+        # Optional: one anchor per non-overlap 40-frame chunk in offline_meta_only
+        # mode, so each real frame is consumed at most once per epoch.
+        offline_unique_anchor=False,
+        # If True, drop tail chunk shorter than len(frames). If False, tail is
+        # padded by repeating its last frame index.
+        offline_drop_last_chunk=False,
+    ),
     val=dict(frames=frames),
     test=dict(frames=frames),
 )
@@ -86,7 +94,7 @@ lr_config = dict(
     min_lr_ratio=1e-2,
 )
 
-total_epochs = 12
+total_epochs = 1
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 
 # Save only alignment trainable weights, not full model checkpoints.

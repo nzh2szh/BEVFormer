@@ -20,13 +20,27 @@ def parse_args():
     parser.add_argument('--base-ckpt', default=None, help='base checkpoint path for validation')
     parser.add_argument('--samples-per-gpu', type=int, default=1, help='validation batch size per gpu')
     parser.add_argument('--workers-per-gpu', type=int, default=2, help='validation workers per gpu')
+    parser.add_argument(
+        '--val-cuda-visible-devices',
+        default=None,
+        help='optional CUDA_VISIBLE_DEVICES value used only for validation subprocess')
     parser.add_argument('--poll-seconds', type=float, default=10.0, help='checkpoint polling interval in seconds')
     parser.add_argument('--summary-file', default='align_val_summary.json', help='summary json file name in work dir')
     parser.add_argument('--load-report-dir', default='align_val_load_reports', help='directory name in work dir for per-epoch load reports')
     parser.add_argument('--max-align-missing-keys', type=int, default=None, help='pass-through to validate_vlm_align.py')
     parser.add_argument('--fail-on-unexpected-keys', action='store_true', help='pass-through to validate_vlm_align.py')
     parser.add_argument('--stop-on-val-fail', action='store_true', help='stop training immediately if any epoch validation fails')
+    parser.add_argument(
+        '--validate-after-train',
+        action='store_true',
+        help='run validations only after training exits (no concurrent train/val)')
     args, train_extra = parser.parse_known_args()
+    # Keep compatibility with shell-style separator:
+    #   train_validate_vlm_align.py ... -- --cfg-options ...
+    # argparse keeps the separator token in unknown args, but train.py does not
+    # accept a standalone "--", so strip it before forwarding.
+    if train_extra and train_extra[0] == '--':
+        train_extra = train_extra[1:]
     args.train_extra = train_extra
     return args
 
@@ -48,14 +62,17 @@ def extract_epoch_from_name(path: Path):
 
 
 def parse_metrics(stdout_text):
+    val_loss_align = None
     i2t = None
     t2i = None
     for line in stdout_text.splitlines():
+        if line.startswith('val_loss_align:'):
+            val_loss_align = float(line.split(':', 1)[1].strip())
         if line.startswith('i2t_top1:'):
             i2t = float(line.split(':', 1)[1].strip())
         if line.startswith('t2i_top1:'):
             t2i = float(line.split(':', 1)[1].strip())
-    return i2t, t2i
+    return val_loss_align, i2t, t2i
 
 
 def save_summary(summary_path: Path, records):
@@ -79,6 +96,19 @@ def run_validate(args, config_path, base_ckpt, align_ckpt, work_dir: Path):
         str(args.workers_per_gpu),
     ]
 
+    train_extra = list(getattr(args, 'train_extra', []) or [])
+    offline_train_mode = any(x.startswith('model.run_mode=offline_train') for x in train_extra)
+    if offline_train_mode:
+        cmd.extend([
+            '--cfg-options',
+            'model.run_mode=offline_infer_validate',
+            'model.offline_split=val',
+            'data.val.offline_meta_only=True',
+        ])
+        scene_json_override = next((x for x in train_extra if x.startswith('model.scene_json=')), None)
+        if scene_json_override is not None:
+            cmd.append(scene_json_override)
+
     if args.max_align_missing_keys is not None:
         cmd.extend(['--max-align-missing-keys', str(args.max_align_missing_keys)])
     if args.fail_on_unexpected_keys:
@@ -89,14 +119,19 @@ def run_validate(args, config_path, base_ckpt, align_ckpt, work_dir: Path):
     load_report_path = load_report_dir / (align_ckpt.stem + '.json')
     cmd.extend(['--load-report', str(load_report_path)])
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    i2t, t2i = parse_metrics(proc.stdout)
+    env = os.environ.copy()
+    if args.val_cuda_visible_devices is not None:
+        env['CUDA_VISIBLE_DEVICES'] = str(args.val_cuda_visible_devices)
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    val_loss_align, i2t, t2i = parse_metrics(proc.stdout)
 
     return {
         'epoch': extract_epoch_from_name(align_ckpt),
         'align_ckpt': str(align_ckpt),
         'load_report': str(load_report_path),
         'returncode': proc.returncode,
+        'val_loss_align': val_loss_align,
         'i2t_top1': i2t,
         't2i_top1': t2i,
         'stdout': proc.stdout,
@@ -141,21 +176,28 @@ def main():
                 key=extract_epoch_from_name,
             )
 
-            for ckpt in ckpts:
-                ckpt_s = str(ckpt)
-                if ckpt_s in seen:
-                    continue
+            if not args.validate_after_train:
+                for ckpt in ckpts:
+                    ckpt_s = str(ckpt)
+                    if ckpt_s in seen:
+                        continue
 
-                print('Validate new checkpoint: {}'.format(ckpt_s))
-                rec = run_validate(args, config_path, base_ckpt, ckpt, work_dir)
-                records.append(rec)
-                seen.add(ckpt_s)
-                save_summary(summary_path, records)
+                    print('Validate new checkpoint: {}'.format(ckpt_s))
+                    rec = run_validate(args, config_path, base_ckpt, ckpt, work_dir)
+                    records.append(rec)
+                    seen.add(ckpt_s)
+                    save_summary(summary_path, records)
 
-                if rec['returncode'] != 0:
-                    print('Validation failed on {} with code {}'.format(ckpt_s, rec['returncode']))
-                    if args.stop_on_val_fail and train_proc.poll() is None:
-                        train_proc.terminate()
+                    if rec['returncode'] != 0:
+                        print('Validation failed on {} with code {}'.format(ckpt_s, rec['returncode']))
+                        if rec.get('stderr'):
+                            print('Validation stderr (tail):')
+                            print('\n'.join(rec['stderr'].splitlines()[-30:]))
+                        elif rec.get('stdout'):
+                            print('Validation stdout (tail):')
+                            print('\n'.join(rec['stdout'].splitlines()[-30:]))
+                        if args.stop_on_val_fail and train_proc.poll() is None:
+                            train_proc.terminate()
 
             train_rc = train_proc.poll()
             if train_rc is not None:

@@ -347,9 +347,127 @@ extract 用它决定导出哪一帧；offline 模式用它决定从哪一帧向�
 
 --------------------------------------------------------------------------------------------------------
 
+date: 202606202115
+
+数据集新增无重叠采样开关
+在 nuscenes_dataset_v2.py:16 增加参数：
+offline_unique_anchor
+offline_drop_last_chunk
+在 nuscenes_dataset_v2.py:41 新增 _build_offline_chunks：
+按 scene 分组
+按 len(frames) 分块（例如 40 帧一块）
+每块只对应 1 个训练样本（非滑窗）
+在 nuscenes_dataset_v2.py:60 改写 len：
+开启 offline_unique_anchor 且 offline_meta_only 时，长度变为 chunk 数
+在 nuscenes_dataset_v2.py:67 改造 _prepare_offline_meta_only：
+构造块内固定时序元数据
+把精确 frame 列表写入 anchor meta 的 offline_frame_nbrs
+尾块可选：
+drop（offline_drop_last_chunk=True）
+pad 最后一帧（False）
+检测器支持按显式 frame 列表读取（避免再次滑窗重叠）
+在 bevformerv2_debertav3_align.py:656 的 _load_offline_bev_sequence 中：
+若 meta 含 offline_frame_nbrs，优先使用该列表加载
+否则保持旧逻辑 _select_offline_frame_numbers
+配置暴露开关
+在 bevformerv2-r50-t8-24ep_debertav3_align.py:67 的 train 数据配置新增：
+offline_unique_anchor=False
+offline_drop_last_chunk=False
+
+当同时开启这两个条件时：
+
+data.train.offline_meta_only=True
+data.train.offline_unique_anchor=True
+数据集不再按滑窗随机取任意 anchor，而是先按 scene 切成不重叠的 40 帧块，每个块只生成 1 个样本（1 个“anchor 样本”），实现位置在 nuscenes_dataset_v2.py:41 和 nuscenes_dataset_v2.py:67。
+模型侧会优先按这个样本里显式给的 frame 列表读取，不再二次滑窗，见 bevformerv2_debertav3_align.py:656。
+
+所以你说的这句在该模式下成立：
+
+这个 epoch 内，已经训练过的那一块，不会再被“随机 anchor”重复补齐训练。
+两个边界注意点：
+
+如果尾块不足 40 且 offline_drop_last_chunk=False，会在该尾块内部用最后一帧做 pad（只影响尾块）。
+多卡 DDP 下，若 sampler 需要补齐到可整除，极少量块可能被重复分配一次（这是采样器层面的）。单卡时最干净。
+
+默认模式（不打开 offline_unique_anchor）
+是，逻辑保持不变。还是按原来的 anchor 选帧策略补齐，走 detector 里的选择逻辑（past_only 或 past_then_future），入口在 bevformerv2_debertav3_align.py:656。
+
+新的无重叠模式（offline_meta_only=True 且 offline_unique_anchor=True）
+这里不再用“anchor 前后补齐的滑窗逻辑”来构造训练片段，而是 dataset 先按 40 帧分块并把明确帧号传下去，位置在 nuscenes_dataset_v2.py:41 和 nuscenes_dataset_v2.py:67。
+detector 会优先用这份显式帧号，不再二次按 anchor 滑窗补齐，判断点在 bevformerv2_debertav3_align.py:661。
+
+一句话总结：默认不变；开启无重叠开关后，补齐逻辑改为“按块固定帧列表”，不是原先的 anchor 滑窗补齐。
+
+
+
+按“开启无重叠开关后，一条样本从生成到读取”的完整链路详细讲。
+
+前提条件（同时满足）：
+
+data.train.offline_meta_only=True
+data.train.offline_unique_anchor=True
+配置入口在 bevformerv2-r50-t8-24ep_debertav3_align.py:67。
+
+1. 先按 scene 建“不重叠分块”
+实现在 nuscenes_dataset_v2.py:41。
+
+逻辑是：
+
+把全量 data_infos 按 scene_token 分组。
+每个 scene 内按 frame_idx 升序排列。
+以 queue_length（你的配置里是 40）为步长切块。
+也就是第 1 块 [0:40]，第 2 块 [40:80]，第 3 块 [80:120]……
+每个块只产生 1 个训练样本，不再滑窗偏移 1 帧去生成下一条样本。
+这一步已经从根上消除了“anchor 滑动导致同一帧跨样本重复出现”的主来源。
+
+2. 数据集长度改为“块数”
+实现在 nuscenes_dataset_v2.py:60。
+
+也就是说一个 epoch 迭代的不是原始帧数，而是 chunk 数。
+每个 chunk 对应一次训练输入。
+
+3. 每个 chunk 显式产出固定帧列表
+实现在 nuscenes_dataset_v2.py:67。
+
+关键点：
+
+取当前 chunk 的 index 列表。
+按 frames 的时序键（-39 到 0）把这些帧填进 temporal meta。
+同时把真实 frame_nbr 列表写到 anchor meta 里：offline_frame_nbrs（见 nuscenes_dataset_v2.py:95）。
+这相当于告诉后端模型：“这条样本就用这 40 个明确帧号，不要你再推导。”
+
+4. detector 优先用显式帧列表，不再按 anchor 二次选帧
+实现在 bevformerv2_debertav3_align.py:656。
+
+行为是：
+
+如果检测到 offline_frame_nbrs，就直接按这个列表加载 pth。
+只有没给 offline_frame_nbrs 才回退到旧逻辑 _select_offline_frame_numbers（past_only / past_then_future）。
+所以开启无重叠后，旧的“anchor 前后补齐策略”在训练主路径里基本被旁路了。
+
+5. 尾块处理（很关键）
+由 offline_drop_last_chunk 控制，配置在 bevformerv2-r50-t8-24ep_debertav3_align.py:72。
+
+False：尾块不足 40 时，用尾块最后一帧补齐到 40（不丢数据，但尾块内部会有重复）。
+True：直接丢弃不足 40 的尾块（最严格“每真实帧最多一次”，但会损失少量样本）。
+
+6. 你关心的“每帧只训练一次”到底如何成立
+
+对大部分完整块：每个真实帧只属于一个 chunk，因此每 epoch 只出现一次。
+可能破坏严格性的只有两处：
+尾块 pad（当 offline_drop_last_chunk=False）。
+DDP 分布式采样器为凑整可能带来极少重复（采样器层面，不是 chunk 逻辑本身）。
+如果你要最严格版本，建议：
+
+offline_drop_last_chunk=True
+单卡或确认分布式 sampler 不做重复补齐（或可接受极小重复）
+
+
+--------------------------------------------------------------------------------------------------------
+
 COMMAND:
 
-offline_extract_bev:
+- offline_extract_bev:
 
 mini train split 导出（写入 train 目录）:
 [ -d data/nuscenes/v1.0-trainval ] || ln -s v1.0-mini data/nuscenes/v1.0-trainval
@@ -424,7 +542,7 @@ data.workers_per_gpu=8 \
 total_epochs=1 \
 runner.max_epochs=1
 
-offline train:
+- offline train:
 
 mini:
 PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
@@ -443,6 +561,29 @@ data.workers_per_gpu=2 \
 data.persistent_workers=False \
 data.prefetch_factor=1
 
+- offline train and val:
+
+mini:
+CUDA_VISIBLE_DEVICES=0 \
+python tools/train_validate_vlm_align.py \
+configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
+--work-dir work_dirs/mini_auto_val \
+--base-ckpt ./ckpts/epoch_24.pth \
+--samples-per-gpu 2 \
+--workers-per-gpu 2 \
+--validate-after-train \
+-- \
+--cfg-options \
+model.run_mode=offline_train \
+model.offline_split=train \
+model.scene_json=data/nuscenes/v1.0-mini/scene.json \
+data.train.ann_file=data/nuscenes/nuscenes_infos_temporal_train.pkl \
+data.train.mono_cfg=None \
+data.train.offline_meta_only=True \
+data.samples_per_gpu=2 \
+data.workers_per_gpu=2 \
+data.persistent_workers=False \
+data.prefetch_factor=1
 
 说明：
 offline_extract_bev 会被内部映射到 extract，只做 BEV 特征导出。

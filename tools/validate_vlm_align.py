@@ -4,7 +4,7 @@ import json
 import os
 
 import torch
-from mmcv import Config
+from mmcv import Config, DictAction
 from mmcv.parallel import MMDataParallel
 from mmcv.runner import load_checkpoint
 
@@ -53,6 +53,11 @@ def parse_args():
         help='fail if align unexpected keys count is greater than 0')
     parser.add_argument('--samples-per-gpu', type=int, default=1, help='val batch size per gpu')
     parser.add_argument('--workers-per-gpu', type=int, default=2, help='num workers per gpu')
+    parser.add_argument(
+        '--cfg-options',
+        nargs='+',
+        action=DictAction,
+        help='override settings in config, key=value format')
     return parser.parse_args()
 
 
@@ -223,9 +228,22 @@ def main():
     args = parse_args()
 
     cfg = Config.fromfile(args.config)
+    if args.cfg_options is not None:
+        cfg.merge_from_dict(args.cfg_options)
     import_plugin(cfg, args.config)
 
-    dataset = build_dataset(cfg.data.val)
+    # Some configs may accidentally carry dataloader-only keys inside val cfg.
+    # Remove them before dataset construction to avoid kwargs errors.
+    val_cfg = cfg.data.val.copy()
+    # Retrieval validation should always use test/eval dataset behavior.
+    # Some inherited configs keep val.test_mode=False for training-time hooks,
+    # which would route to prepare_train_data and require gt labels.
+    val_cfg['test_mode'] = True
+    for key in ['samples_per_gpu', 'workers_per_gpu', 'persistent_workers', 'prefetch_factor', 'shuffle']:
+        if key in val_cfg:
+            val_cfg.pop(key)
+
+    dataset = build_dataset(val_cfg)
     # Validation uses deterministic order (shuffle=False) to keep results
     # reproducible and comparable across checkpoints.
     dataloader = build_dataloader(
@@ -252,6 +270,7 @@ def main():
 
     i2t_scores = []
     t2i_scores = []
+    loss_scores = []
 
     with torch.no_grad():
         for data in dataloader:
@@ -265,6 +284,8 @@ def main():
                         i2t_scores.append(float(out['acc_i2t_top1']))
                     if 'acc_t2i_top1' in out:
                         t2i_scores.append(float(out['acc_t2i_top1']))
+                    if 'loss_align' in out:
+                        loss_scores.append(float(out['loss_align']))
 
     if len(i2t_scores) == 0 or len(t2i_scores) == 0:
         # Usually indicates mismatched model/output path or missing retrieval
@@ -275,6 +296,9 @@ def main():
     # Final metrics are simple means across the collected per-sample values.
     i2t_top1 = sum(i2t_scores) / len(i2t_scores)
     t2i_top1 = sum(t2i_scores) / len(t2i_scores)
+    if len(loss_scores) > 0:
+        val_loss_align = sum(loss_scores) / len(loss_scores)
+        print(f'val_loss_align: {val_loss_align:.6f}')
     print(f'i2t_top1: {i2t_top1:.6f}')
     print(f't2i_top1: {t2i_top1:.6f}')
 
