@@ -200,12 +200,12 @@ tools: [ "#codebase", "#terminal" ]
 # 训练效率
 三大部分，即 BEVFormer-v2, DeBERTa-v3-base, lightweight transformer （对齐网络），在离线提取bev特征，训练、推理、验证时，使用PyTorch 的 AMP（Automatic Mixed Precision，自动混合精度）采用BF16精度。
 
-1. 采用“权重保持 FP32 + autocast”机制
+## 采用“权重保持 FP32 + autocast”机制
 - 初始化时，BEVFormer-v2、DeBERTa-v3-base、lightweight transformer 的权重保持原生 FP32，不做全模型 .to(torch.bfloat16) 强转。
 - 在 forward 前向传播时，用 PyTorch 官方的 torch.cuda.amp.autocast(dtype=torch.bfloat16) 包裹，让 AMP 自动选择算子精度：
     - 支持 BF16 的算子走 BF16（节省显存、提升吞吐）。
     - 不支持 BF16 的算子（例如部分环境中的 nearest2d）自动回退 FP32，避免运行时报错。
 
-2. 区分“运行状态”与“落盘状态”
+## 区分“运行状态”与“落盘状态”
 - BEVFormer-v2 和 DeBERTa-v3：因为在当前训练中是完全冻结（requires_grad=False）的，它们在硬盘上的官方预训练文件保持原生 FP32 格式，不需要改动。
 - Lightweight Transformer （对齐网络）：是当前唯一需要更新参数和落盘的文件。在“FP32 权重 + AMP autocast”方案下，训练时计算图可混精，但参数落盘默认保持参数自身 dtype（通常为 FP32）。

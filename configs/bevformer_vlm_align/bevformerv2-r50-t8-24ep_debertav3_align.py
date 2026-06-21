@@ -54,7 +54,7 @@ model = dict(
 find_unused_parameters = True
 
 # Keep backbone ckpt loading for frozen BEVFormer weights.
-load_from = './ckpts/epoch_24.pth'
+load_from = './ckpts/bevformer/epoch_24.pth'
 
 # Raise batch size as much as memory allows to improve in-batch negatives.
 data = dict(
@@ -98,7 +98,12 @@ total_epochs = 1
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 
 # Save only alignment trainable weights, not full model checkpoints.
-checkpoint_config = None
+checkpoint_config = dict(
+interval=1,
+by_epoch=True,
+max_keep_ckpts=3,
+save_last=True,
+)
 custom_hooks = [
     dict(
         type='SaveTrainableStateDictHook',

@@ -463,6 +463,25 @@ offline_drop_last_chunk=True
 单卡或确认分布式 sampler 不做重复补齐（或可接受极小重复）
 
 
+
+这一轮你提的“补 val loss + 全局 recall”改动里，没有改训练计算逻辑。
+
+具体是：
+
+改了验证/评估链路
+tools/validate_vlm_align.py
+用途：从 batch 内指标改为可做全局检索矩阵评估，并打印 val_loss_align / R@K。
+改了测试输出字段（给验证脚本用）
+projects/mmdet3d_plugin/bevformer/detectors/bevformerv2_debertav3_align.py
+用途：在 forward_test 里额外返回 vision/text embedding 和 loss_align，用于 val 端聚合。
+注意：forward_train 没动。
+改了联训联验脚本的汇总解析
+tools/train_validate_vlm_align.py
+用途：解析并记录 val_loss_align、切换验证模式。
+注意：不改变训练 loss 计算。
+所以训练侧的 loss 定义、反向传播、优化器更新逻辑都没改。
+
+
 --------------------------------------------------------------------------------------------------------
 
 COMMAND:
@@ -545,9 +564,12 @@ runner.max_epochs=1
 - offline train:
 
 mini:
+本次训练（生成可续训的全量 checkpoint）
+CUDA_VISIBLE_DEVICES=0 \
 PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
 python tools/train.py \
 configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
+--work-dir work_dirs/mini_resumeable \
 --no-validate \
 --cfg-options \
 model.run_mode=offline_train \
@@ -559,17 +581,42 @@ data.train.offline_meta_only=True \
 data.samples_per_gpu=2 \
 data.workers_per_gpu=2 \
 data.persistent_workers=False \
-data.prefetch_factor=1
+data.prefetch_factor=1 \
+total_epochs=1 \
+runner.max_epochs=1
+
+下次训练（加载上次全量 checkpoint 继续）
+CUDA_VISIBLE_DEVICES=0 \
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
+python tools/train.py \
+configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
+--work-dir work_dirs/mini_resumeable \
+--resume-from work_dirs/mini_resumeable/epoch_1.pth \
+--no-validate \
+--cfg-options \
+model.run_mode=offline_train \
+model.offline_split=train \
+model.scene_json=data/nuscenes/v1.0-mini/scene.json \
+data.train.ann_file=data/nuscenes/nuscenes_infos_temporal_train.pkl \
+data.train.mono_cfg=None \
+data.train.offline_meta_only=True \
+data.samples_per_gpu=2 \
+data.workers_per_gpu=2 \
+data.persistent_workers=False \
+data.prefetch_factor=1 \
+total_epochs=2 \
+runner.max_epochs=2
 
 - offline train and val:
 
 mini:
 CUDA_VISIBLE_DEVICES=0 \
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
 python tools/train_validate_vlm_align.py \
 configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
---work-dir work_dirs/mini_auto_val \
---base-ckpt ./ckpts/epoch_24.pth \
---samples-per-gpu 2 \
+--work-dir work_dirs/mini_auto_val_fullckpt \
+--base-ckpt ./ckpts/bevformer/epoch_24.pth \
+--samples-per-gpu 1 \
 --workers-per-gpu 2 \
 --validate-after-train \
 -- \
@@ -584,6 +631,32 @@ data.samples_per_gpu=2 \
 data.workers_per_gpu=2 \
 data.persistent_workers=False \
 data.prefetch_factor=1
+
+CUDA_VISIBLE_DEVICES=0 \
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
+python tools/train_validate_vlm_align.py \
+configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
+--work-dir work_dirs/mini_auto_val_fullckpt \
+--base-ckpt ./ckpts/bevformer/epoch_24.pth \
+--samples-per-gpu 1 \
+--workers-per-gpu 2 \
+--validate-after-train \
+-- \
+--resume-from work_dirs/mini_auto_val_fullckpt/epoch_1.pth \
+--cfg-options \
+model.run_mode=offline_train \
+model.offline_split=train \
+model.scene_json=data/nuscenes/v1.0-mini/scene.json \
+data.train.ann_file=data/nuscenes/nuscenes_infos_temporal_train.pkl \
+data.train.mono_cfg=None \
+data.train.offline_meta_only=True \
+data.samples_per_gpu=2 \
+data.workers_per_gpu=2 \
+data.persistent_workers=False \
+data.prefetch_factor=1 \
+total_epochs=2 \
+runner.max_epochs=2
+
 
 说明：
 offline_extract_bev 会被内部映射到 extract，只做 BEV 特征导出。

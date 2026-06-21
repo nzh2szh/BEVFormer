@@ -1015,6 +1015,11 @@ class BEVFormerDebertaAlign(BEVFormerV2):
 
             vision_feat = self._encode_vision(bev_seq)
             texts = self._resolve_scene_text(img_metas, scene_text=scene_text)
+            temporal_metas = self._parse_temporal_meta(img_metas)
+            scene_tokens = []
+            for sample_metas in temporal_metas:
+                scene_token, _, _ = self._get_scene_token_and_group(sample_metas)
+                scene_tokens.append(scene_token)
             text_feat = self._encode_text(texts, device=device)
             loss_align, i2t_top1, t2i_top1, logits = self._contrastive_loss(
                 vision_feat,
@@ -1030,6 +1035,11 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 'loss_align': float(loss_align.item()),
                 'acc_i2t_top1': float(i2t_top1.item()),
                 'acc_t2i_top1': float(t2i_top1.item()),
+                # Export normalized embeddings for global retrieval evaluation
+                # in validation scripts (full NxN similarity matrix).
+                'vision_feat': vision_feat[i].detach().cpu(),
+                'text_feat': text_feat[i].detach().cpu(),
+                'scene_token': scene_tokens[i],
                 'scene_text': texts[i],
             })
         return results

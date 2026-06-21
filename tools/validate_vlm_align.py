@@ -4,6 +4,7 @@ import json
 import os
 
 import torch
+import torch.nn.functional as F
 from mmcv import Config, DictAction
 from mmcv.parallel import MMDataParallel
 from mmcv.runner import load_checkpoint
@@ -268,9 +269,10 @@ def main():
     model = MMDataParallel(model.cuda(), device_ids=[0])
     model.eval()
 
-    i2t_scores = []
-    t2i_scores = []
     loss_scores = []
+    all_vision_feats = []
+    all_scene_tokens = []
+    scene_text_feat_map = {}
 
     with torch.no_grad():
         for data in dataloader:
@@ -280,27 +282,89 @@ def main():
                 outputs = [outputs]
             for out in outputs:
                 if isinstance(out, dict):
-                    if 'acc_i2t_top1' in out:
-                        i2t_scores.append(float(out['acc_i2t_top1']))
-                    if 'acc_t2i_top1' in out:
-                        t2i_scores.append(float(out['acc_t2i_top1']))
                     if 'loss_align' in out:
                         loss_scores.append(float(out['loss_align']))
+                    if 'vision_feat' in out and 'text_feat' in out and 'scene_token' in out:
+                        all_vision_feats.append(out['vision_feat'].float())
+                        scene_token = out.get('scene_token', None)
+                        all_scene_tokens.append(scene_token)
+                        if scene_token is not None and scene_token not in scene_text_feat_map:
+                            scene_text_feat_map[scene_token] = out['text_feat'].float()
 
-    if len(i2t_scores) == 0 or len(t2i_scores) == 0:
-        # Usually indicates mismatched model/output path or missing retrieval
-        # fields in inference outputs.
-        print('No retrieval metrics were produced by the model outputs.')
+    def _recall_at_k(sim_matrix, positive_mask, k):
+        # topk runs on candidate axis(dim=1), so k must be capped by #candidates.
+        n_candidates = sim_matrix.size(1)
+        k = min(k, n_candidates)
+        if k <= 0:
+            return 0.0
+        valid_rows = positive_mask.any(dim=1)
+        if not valid_rows.any():
+            return 0.0
+        sim_valid = sim_matrix[valid_rows]
+        pos_valid = positive_mask[valid_rows]
+        topk_idx = sim_valid.topk(k, dim=1, largest=True).indices
+        topk_pos = pos_valid.gather(1, topk_idx)
+        return topk_pos.any(dim=1).float().mean().item()
+
+    def _multi_positive_infonce(logits, positive_mask):
+        valid_rows = positive_mask.any(dim=1)
+        if not valid_rows.any():
+            return 0.0
+        logits = logits[valid_rows]
+        positive_mask = positive_mask[valid_rows]
+        neg_inf = torch.finfo(logits.dtype).min
+        pos_logits = logits.masked_fill(~positive_mask, neg_inf)
+        pos_lse = torch.logsumexp(pos_logits, dim=1)
+        all_lse = torch.logsumexp(logits, dim=1)
+        return -(pos_lse - all_lse).mean().item()
+
+    # Scene-level text deduplicated evaluation:
+    # visual side keeps all clips; text side keeps one embedding per scene.
+    if len(all_vision_feats) > 0 and len(scene_text_feat_map) > 0:
+        vision_mat = torch.stack(all_vision_feats, dim=0)
+        scene_tokens = list(scene_text_feat_map.keys())
+        text_mat = torch.stack([scene_text_feat_map[tok] for tok in scene_tokens], dim=0)
+        vision_mat = F.normalize(vision_mat, dim=-1)
+        text_mat = F.normalize(text_mat, dim=-1)
+        sim = vision_mat @ text_mat.t()
+
+        n_clip, n_scene = sim.size(0), sim.size(1)
+        token_to_scene_idx = {tok: j for j, tok in enumerate(scene_tokens)}
+        positive_mask = torch.zeros((n_clip, n_scene), dtype=torch.bool)
+        for i, tok in enumerate(all_scene_tokens):
+            if tok in token_to_scene_idx:
+                positive_mask[i, token_to_scene_idx[tok]] = True
+
+        if positive_mask.sum().item() == 0:
+            print('No valid scene-token matches found for scene-level retrieval metrics.')
+            return
+
+        logit_scale = model.module.logit_scale.exp().detach().cpu().float()
+        logits = sim * logit_scale
+        loss_i2t = _multi_positive_infonce(logits, positive_mask)
+        loss_t2i = _multi_positive_infonce(logits.t(), positive_mask.t())
+        val_loss_align = 0.5 * (loss_i2t + loss_t2i)
+
+        i2t_r1 = _recall_at_k(sim, positive_mask, 1)
+        i2t_r5 = _recall_at_k(sim, positive_mask, 5)
+        i2t_r10 = _recall_at_k(sim, positive_mask, 10)
+        t2i_r1 = _recall_at_k(sim.t(), positive_mask.t(), 1)
+        t2i_r5 = _recall_at_k(sim.t(), positive_mask.t(), 5)
+        t2i_r10 = _recall_at_k(sim.t(), positive_mask.t(), 10)
+
+        print(f'val_loss_align: {val_loss_align:.6f}')
+
+        # Keep compatibility keys for caller scripts: top1 lines now mean
+        # global R@1 on full validation set.
+        print(f'i2t_top1: {i2t_r1:.6f}')
+        print(f't2i_top1: {t2i_r1:.6f}')
+        print(f'i2t_r5: {i2t_r5:.6f}')
+        print(f'i2t_r10: {i2t_r10:.6f}')
+        print(f't2i_r5: {t2i_r5:.6f}')
+        print(f't2i_r10: {t2i_r10:.6f}')
         return
 
-    # Final metrics are simple means across the collected per-sample values.
-    i2t_top1 = sum(i2t_scores) / len(i2t_scores)
-    t2i_top1 = sum(t2i_scores) / len(t2i_scores)
-    if len(loss_scores) > 0:
-        val_loss_align = sum(loss_scores) / len(loss_scores)
-        print(f'val_loss_align: {val_loss_align:.6f}')
-    print(f'i2t_top1: {i2t_top1:.6f}')
-    print(f't2i_top1: {t2i_top1:.6f}')
+    print('No scene-level retrieval metrics were produced by the model outputs.')
 
 
 if __name__ == '__main__':
