@@ -35,11 +35,22 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
         self._offline_chunks = None
 
         super().__init__(*args, **kwargs)
+        self._normalize_picklable_fields()
 
         if self.offline_meta_only and self.offline_unique_anchor:
             self._offline_chunks = self._build_offline_chunks()
         if not self.test_mode and mono_cfg is not None:
             self.mono_dataset = DD3DNuscenesDataset(**mono_cfg)
+
+    def _normalize_picklable_fields(self):
+        """Normalize fields that may break multiprocessing spawn pickling."""
+        eval_cfg = getattr(self, 'eval_detection_configs', None)
+        if eval_cfg is None:
+            return
+
+        class_names = getattr(eval_cfg, 'class_names', None)
+        if isinstance(class_names, type({}.keys())):
+            eval_cfg.class_names = list(class_names)
 
     def _build_offline_chunks(self):
         """Build non-overlap chunks so each frame is used once per epoch."""

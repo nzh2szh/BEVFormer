@@ -484,6 +484,170 @@ tools/train_validate_vlm_align.py
 
 --------------------------------------------------------------------------------------------------------
 
+date: 202606202115
+
+先说结论
+
+你当前实现已经有跨卡 gather 和对称 InfoNCE，基础很好。入口在 projects/mmdet3d_plugin/bevformer/detectors/bevformerv2_debertav3_align.py。
+队列改造建议做成 可开关、短队列、双向队列、跨卡入队、同场景负样本掩码（可选） 这 5 个点。
+训练建议仍保持每卡 batch 一致，队列只负责放大负样本池，不替代 DDP 基本对称性。
+落地步骤
+
+在模型初始化里加队列参数与缓冲区
+
+文件: projects/mmdet3d_plugin/bevformer/detectors/bevformerv2_debertav3_align.py
+
+在现有 logit_scale 附近新增：
+use_feature_queue: bool
+queue_size: int（建议先 128）
+queue_warmup_steps: int（建议先 50）
+queue_use_scene_mask: bool（建议先 True）
+
+register_buffer 新增：
+text_queue, vision_queue，形状 [K, C]
+text_queue_scene_id, vision_queue_scene_id，形状 [K]
+queue_ptr, queue_valid_len, global_step
+
+新增队列更新函数（必须处理回绕）:
+
+文件同上
+新增 _dequeue_and_enqueue(keys, scene_ids, queue_name)
+要点：
+keys 必须先 detach 再入队
+批量写入时处理 ptr + batch_size 超过 K 的回绕
+更新 queue_valid_len，避免 warmup 初期读到未填满区域
+
+改造损失函数为 当前批 + 队列负样本
+当前函数在 projects/mmdet3d_plugin/bevformer/detectors/bevformerv2_debertav3_align.py
+目标逻辑：
+先保留你已有的 gather_ddp，拿到 global_vision/global_text
+i2t: logits = [vision 对 global_text] 拼接 [vision 对 text_queue_valid]
+t2i: logits = [text 对 global_vision] 拼接 [text 对 vision_queue_valid]
+labels 仍指向 global 部分的正样本，不指向队列区
+关键细节：
+队列部分只作为负样本，必须无梯度
+如果启用 scene mask，把 与当前样本同 scene 的队列项 置为极小值，避免假负样本污染
+
+在 forward_train 里补 scene_id 并入队
+训练入口在 projects/mmdet3d_plugin/bevformer/detectors/bevformerv2_debertav3_align.py
+做法：
+复用你现有 scene_token 解析逻辑，拿到每个样本的 scene_token
+映射成稳定 scene_id（可用哈希后取 int64）
+loss 计算完成后，用 gathered 的当前批 text/vision 特征和 scene_id 入队
+先更新 global_step，再按 warmup 决定是否启用队列 logits（前几步仅用原始 global batch）
+
+
+配置层新增开关
+配置文件: configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py
+新增建议默认值：
+use_feature_queue=True
+queue_size=128
+queue_warmup_steps=50
+queue_use_scene_mask=True
+
+验证与推理保持不变
+forward_test 里继续不用队列，保持你现在的全局评估语义，避免指标定义混淆。位置在 projects/mmdet3d_plugin/bevformer/detectors/bevformerv2_debertav3_align.py。
+
+参数建议（首轮）
+
+queue_size: 128（12GB 显存更稳）
+accumulation_steps: 2 或 4（和队列可并用）
+每卡 batch: 1（异构卡下最稳）
+温度仍用你当前 learnable logit_scale，不必改
+
+你这个架构下的注意点
+
+冻结 backbone 只说明骨干特征稳定，不代表 projector 后特征完全不漂移。
+所以队列不要太长，先 128；太长会加重陈旧特征副作用。
+scene 去重掩码很重要，否则同场景文本容易被当负样本。
+
+验收标准（建议一次性检查）
+
+打印每步有效负样本数，确认从 global_batch 扩展到 global_batch + queue_valid_len
+监控 loss_align 曲线是否更平滑
+监控 i2t_top1 和 t2i_top1 是否比无队列版本稳定提升
+确认 DDP 下无 shape mismatch、无死锁
+
+
+
+已完成改动
+
+模型新增队列参数（可开关）
+在构造函数中加入：
+use_feature_queue
+feature_queue_size
+feature_queue_warmup_steps
+位置: bevformerv2_debertav3_align.py:45
+
+新增 FIFO 队列缓冲区与更新逻辑
+新增 buffer：
+text_queue
+vision_queue
+queue_ptr
+queue_valid_len
+queue_step
+新增函数：
+_gather_no_grad
+_dequeue_and_enqueue
+_enqueue_feature_queue
+_queue_ready
+位置: bevformerv2_debertav3_align.py:268, bevformerv2_debertav3_align.py:924
+
+对比损失支持“当前批 + 队列负样本”
+_contrastive_loss 新增 use_queue 开关
+训练时可把队列负样本拼到 logits 右侧
+labels 仍指向当前 global batch 正样本区域
+位置: bevformerv2_debertav3_align.py:985
+
+训练启用队列，测试关闭队列
+forward_train:
+use_queue=self.use_feature_queue
+每步 loss 后入队并 step+1
+位置: bevformerv2_debertav3_align.py:1071
+forward_test:
+明确 use_queue=False，保持验证语义稳定
+位置: bevformerv2_debertav3_align.py:1121
+
+配置已暴露并默认开启最小队列
+use_feature_queue=True
+feature_queue_size=128
+feature_queue_warmup_steps=50
+位置: bevformerv2-r50-t8-24ep_debertav3_align.py:47
+
+
+把 scene mask 版本落地了，当前是“队列 + scene mask”可开关实现，默认在配置里已开启。
+
+本次改动
+
+新增模型参数 queue_use_scene_mask（默认 False）
+见 projects/mmdet3d_plugin/bevformer/detectors/bevformerv2_debertav3_align.py
+
+队列新增 scene id 缓冲区
+新增 text_queue_scene_id / vision_queue_scene_id
+见 projects/mmdet3d_plugin/bevformer/detectors/bevformerv2_debertav3_align.py
+
+新增 scene token 到稳定 int64 id 的映射与解析
+新增 _resolve_scene_tokens / _scene_token_to_id / _resolve_scene_ids
+见 projects/mmdet3d_plugin/bevformer/detectors/bevformerv2_debertav3_align.py
+
+队列入队改为同时写入 feature 和 scene id
+改造 _dequeue_and_enqueue / _enqueue_feature_queue
+见 projects/mmdet3d_plugin/bevformer/detectors/bevformerv2_debertav3_align.py
+
+对比损失接入 scene mask
+在队列负样本 logits 上对同 scene 项做 masked_fill(-1e4)
+见 projects/mmdet3d_plugin/bevformer/detectors/bevformerv2_debertav3_align.py
+
+训练前向接入 scene_ids
+forward_train 已传入 scene_ids 到 loss 和 enqueue
+见 projects/mmdet3d_plugin/bevformer/detectors/bevformerv2_debertav3_align.py
+
+配置已开启 scene mask
+queue_use_scene_mask=True
+见 configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py
+
+--------------------------------------------------------------------------------------------------------
+
 COMMAND:
 
 - offline_extract_bev:
@@ -561,15 +725,25 @@ data.workers_per_gpu=8 \
 total_epochs=1 \
 runner.max_epochs=1
 
+说明：
+offline_extract_bev 会被内部映射到 extract，只做 BEV 特征导出。
+我给你把 epoch 压到 1，避免重复跑多轮。
+导出结果会按 split 写入配置里的 offline_bev_dir_by_split（train/val/test）对应目录。
+offline_infer_validate 默认使用 val split 目录。
+
 - offline train:
 
+DDP 2x3080Ti + 1x3090，v1.0-mini，offline train：
+
 mini:
-本次训练（生成可续训的全量 checkpoint）
-CUDA_VISIBLE_DEVICES=0 \
+第一次训练（生成可续训的全量 checkpoint）
+CUDA_VISIBLE_DEVICES=0,1,2 \
 PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
-python tools/train.py \
+torchrun --nproc_per_node=3 --master_port=29501 \
+tools/train.py \
 configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
---work-dir work_dirs/mini_resumeable \
+--launcher pytorch \
+--work-dir work_dirs/mini_ddp_offline_train \
 --no-validate \
 --cfg-options \
 model.run_mode=offline_train \
@@ -578,20 +752,18 @@ model.scene_json=data/nuscenes/v1.0-mini/scene.json \
 data.train.ann_file=data/nuscenes/nuscenes_infos_temporal_train.pkl \
 data.train.mono_cfg=None \
 data.train.offline_meta_only=True \
-data.samples_per_gpu=2 \
-data.workers_per_gpu=2 \
-data.persistent_workers=False \
-data.prefetch_factor=1 \
 total_epochs=1 \
 runner.max_epochs=1
 
-下次训练（加载上次全量 checkpoint 继续）
-CUDA_VISIBLE_DEVICES=0 \
+下次训练（加载上次全量 checkpoint 继续）：
+CUDA_VISIBLE_DEVICES=0,1,2 \
 PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
-python tools/train.py \
+torchrun --nproc_per_node=3 --master_port=29501 \
+tools/train.py \
 configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
---work-dir work_dirs/mini_resumeable \
---resume-from work_dirs/mini_resumeable/epoch_1.pth \
+--launcher pytorch \
+--work-dir work_dirs/mini_ddp_offline_train \
+--resume-from work_dirs/mini_ddp_offline_train/epoch_1.pth \
 --no-validate \
 --cfg-options \
 model.run_mode=offline_train \
@@ -600,24 +772,21 @@ model.scene_json=data/nuscenes/v1.0-mini/scene.json \
 data.train.ann_file=data/nuscenes/nuscenes_infos_temporal_train.pkl \
 data.train.mono_cfg=None \
 data.train.offline_meta_only=True \
-data.samples_per_gpu=2 \
-data.workers_per_gpu=2 \
-data.persistent_workers=False \
-data.prefetch_factor=1 \
 total_epochs=2 \
 runner.max_epochs=2
+
+
 
 - offline train and val:
 
 mini:
+第一次：
 CUDA_VISIBLE_DEVICES=0 \
 PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
 python tools/train_validate_vlm_align.py \
 configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
 --work-dir work_dirs/mini_auto_val_fullckpt \
 --base-ckpt ./ckpts/bevformer/epoch_24.pth \
---samples-per-gpu 1 \
---workers-per-gpu 2 \
 --validate-after-train \
 -- \
 --cfg-options \
@@ -626,20 +795,15 @@ model.offline_split=train \
 model.scene_json=data/nuscenes/v1.0-mini/scene.json \
 data.train.ann_file=data/nuscenes/nuscenes_infos_temporal_train.pkl \
 data.train.mono_cfg=None \
-data.train.offline_meta_only=True \
-data.samples_per_gpu=2 \
-data.workers_per_gpu=2 \
-data.persistent_workers=False \
-data.prefetch_factor=1
+data.train.offline_meta_only=True
 
+后续:
 CUDA_VISIBLE_DEVICES=0 \
 PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
 python tools/train_validate_vlm_align.py \
 configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
 --work-dir work_dirs/mini_auto_val_fullckpt \
 --base-ckpt ./ckpts/bevformer/epoch_24.pth \
---samples-per-gpu 1 \
---workers-per-gpu 2 \
 --validate-after-train \
 -- \
 --resume-from work_dirs/mini_auto_val_fullckpt/epoch_1.pth \
@@ -650,16 +814,127 @@ model.scene_json=data/nuscenes/v1.0-mini/scene.json \
 data.train.ann_file=data/nuscenes/nuscenes_infos_temporal_train.pkl \
 data.train.mono_cfg=None \
 data.train.offline_meta_only=True \
-data.samples_per_gpu=2 \
-data.workers_per_gpu=2 \
-data.persistent_workers=False \
-data.prefetch_factor=1 \
 total_epochs=2 \
 runner.max_epochs=2
 
+ddp 3卡：
+CUDA_VISIBLE_DEVICES=0,1,2 \
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8 \
+torchrun --nproc_per_node=3 --master_port=29501 \
+tools/train.py \
+configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
+--launcher pytorch \
+--work-dir work_dirs/mini_ddp_offline_train_val \
+--no-validate \
+--cfg-options \
+model.run_mode=offline_train \
+model.offline_split=train \
+model.scene_json=data/nuscenes/v1.0-mini/scene.json \
+data.train.ann_file=data/nuscenes/nuscenes_infos_temporal_train.pkl \
+data.train.mono_cfg=None \
+data.train.offline_meta_only=True \
+total_epochs=1 \
+runner.max_epochs=1 \
+&& \
+python tools/validate_vlm_align.py \
+configs/bevformer_vlm_align/bevformerv2-r50-t8-24ep_debertav3_align.py \
+--base-ckpt ./ckpts/bevformer/epoch_24.pth \
+--align-ckpt work_dirs/mini_ddp_offline_train_val/align_trainable_epoch_1.pth \
+--cfg-options \
+model.run_mode=offline_infer_validate \
+model.offline_split=val \
+model.scene_json=data/nuscenes/v1.0-mini/scene.json \
+data.val.offline_meta_only=True
+
+
+每个 epoch 串行执行一次 train，然后立即执行一次 val，再进入下一轮：
+
+mini：
+START_EPOCH=1 \
+END_EPOCH=3 \
+DATASET_PROFILE=mini \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
+./tools/train_val_epoch_serial_ddp.sh
+
+如果继续是：
+START_EPOCH=4 \
+END_EPOCH=6 \
+DATASET_PROFILE=mini \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
+./tools/train_val_epoch_serial_ddp.sh
+
+trainval：
+START_EPOCH=1 \
+END_EPOCH=5 \
+DATASET_PROFILE=trainval \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
+./tools/train_val_epoch_serial_ddp.sh
+
+
+可直接用这条命令就行（可写到任意绝对路径，避免 work_dir 权限问题）：
+python tools/export_train_val_compare.py \
+--work-dir work_dirs/mini_ddp_offline_train_val \
+--output train_val_compare_mini.tsv
 
 说明：
-offline_extract_bev 会被内部映射到 extract，只做 BEV 特征导出。
-我给你把 epoch 压到 1，避免重复跑多轮。
-导出结果会按 split 写入配置里的 offline_bev_dir_by_split（train/val/test）对应目录。
-offline_infer_validate 默认使用 val split 目录。
+这个表按 epoch 合并了 train 与 val 指标。
+train 侧给了末次与均值字段（如 train_last_loss_align、train_avg_loss_align）。
+val 侧给了 val_loss_align、R@1/R@5/R@10 等。
+你之前旧轮次没有 train 指标时会显示 NA，这是正常的，因为当时日志没有被该脚本统计到该轮可用行。
+你现在新跑的轮次会持续可对齐，便于直接和 train 做横向对比。
+
+生成图：可直接用这条命令重复生成：
+python tools/plot_train_val_compare.py \
+--compare-file train_val_compare_mini.tsv \
+--output train_val_compare_mini.png
+
+- 读表：
+epoch
+表示训练轮次编号。
+
+train_last_loss_align
+该 epoch 内“最后一次被日志打印到”的对齐损失（train 侧）。
+更像“该轮末尾状态”。
+
+train_avg_loss_align
+该 epoch 内所有日志点的 loss_align 平均值（train 侧）。
+更像“该轮整体水平”。
+
+val_loss_align
+验证集上的对齐损失（val 侧，全局评估结果）。
+
+train_last_acc_i2t_top1
+训练侧图到文 Top-1 准确率（i2t），取该轮最后一次日志值。
+含义：图像特征检索文本时，Top-1 命中的比例。
+
+val_i2t_top1
+验证侧图到文 Top-1 准确率（i2t）。
+
+train_last_acc_t2i_top1
+训练侧文到图 Top-1 准确率（t2i），取该轮最后一次日志值。
+含义：文本特征检索图像时，Top-1 命中的比例。
+
+val_t2i_top1
+验证侧文到图 Top-1 准确率（t2i）。
+
+快速读表建议：
+
+先看 val_loss_align 和 val_i2t_top1/val_t2i_top1 判断泛化是否变好。
+再看 train_last_loss_align vs train_avg_loss_align 判断该轮末尾是否偏离该轮平均。
+若 train 明显变化但 val 几乎不变，通常是“训练拟合在动、泛化没提升”。
+
+判断过拟合时，建议主看这组关系：
+
+train_avg_loss_align
+看训练集整体是否持续下降（比 train_last_loss_align 更稳）。
+
+val_loss_align
+看验证集是否同步下降。
+如果 train 降、val 不降甚至升，才是典型过拟合信号。
+
+
+
+

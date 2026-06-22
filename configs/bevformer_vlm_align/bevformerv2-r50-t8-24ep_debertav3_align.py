@@ -44,6 +44,10 @@ model = dict(
     spatial_bev_h=200,
     spatial_bev_w=200,
     gather_ddp=True,
+    use_feature_queue=True,
+    feature_queue_size=256,
+    feature_queue_warmup_steps=500,
+    queue_use_scene_mask=True,
     # Enable BF16 runtime for frozen backbones and alignment head.
     use_bf16_amp=True,
     dropout=0.1,
@@ -59,7 +63,7 @@ load_from = './ckpts/bevformer/epoch_24.pth'
 # Raise batch size as much as memory allows to improve in-batch negatives.
 data = dict(
     # Single-GPU online mode with 40 frames is memory-heavy.
-    samples_per_gpu=2,
+    samples_per_gpu=1,
     # Offline alignment uses large tensors; keep workers conservative to avoid
     # /dev/shm pressure inside docker.
     workers_per_gpu=2,
@@ -83,15 +87,19 @@ optimizer = dict(
     lr=1e-4,
     weight_decay=0.01,
 )
-optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
+optimizer_config = dict(
+    type='GradientCumulativeOptimizerHook',
+    cumulative_iters=4,   # 梯度累加步数
+    grad_clip=dict(max_norm=10, norm_type=2),
+)
 
 lr_config = dict(
     _delete_=True,
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=1000,
+    warmup_iters=500,
     warmup_ratio=1.0 / 10,
-    min_lr_ratio=1e-2,
+    min_lr_ratio=1e-4,
 )
 
 total_epochs = 1

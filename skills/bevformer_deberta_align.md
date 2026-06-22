@@ -209,3 +209,53 @@ tools: [ "#codebase", "#terminal" ]
 ## 区分“运行状态”与“落盘状态”
 - BEVFormer-v2 和 DeBERTa-v3：因为在当前训练中是完全冻结（requires_grad=False）的，它们在硬盘上的官方预训练文件保持原生 FP32 格式，不需要改动。
 - Lightweight Transformer （对齐网络）：是当前唯一需要更新参数和落盘的文件。在“FP32 权重 + AMP autocast”方案下，训练时计算图可混精，但参数落盘默认保持参数自身 dtype（通常为 FP32）。
+
+## 小批量训练的负样本扩展（Feature Queue）
+在多卡显存受限场景下（例如每卡物理 batch 较小），除了 DDP gather 和梯度累加，还可以引入特征队列来扩展对比学习负样本池。
+
+### 当前实现版本（队列 + 可选 scene mask）
+- 仅在训练阶段启用队列，验证阶段关闭队列，避免影响检索评估语义。
+- 维护两个 FIFO 队列：
+    - text_queue: 历史文本特征。文本侧入队的是 text_feat（形状 [B, 768]，每个 scene 文本 1 个向量）。
+    - vision_queue: 历史视觉特征。视觉侧入队的是经过时序编码后得到的 vision_feat（形状 [B, 768]，每个样本 1 个向量，已聚合 40 帧信息）。
+- 同时维护 scene id 队列：
+    - text_queue_scene_id / vision_queue_scene_id（与特征队列同长度）。
+- 当前 batch 仍按原有对称 InfoNCE 计算正样本；队列特征仅作为额外负样本拼接到 logits 右侧。
+- 当 queue_use_scene_mask=True 时，会按 scene_id 对队列负样本做掩码：同 scene 的队列项不参与负样本竞争，降低假负样本干扰。
+- 队列更新在每个训练 step 后执行，支持 DDP 下跨卡聚合后再入队（特征和 scene id 一起 gather）。
+- 提供 warmup 机制，前若干 step 仅使用当前批全局负样本，队列填充到稳定后再参与 loss。
+
+### 推荐起始参数
+- use_feature_queue=True
+- feature_queue_size=128
+- feature_queue_warmup_steps=50
+- gather_ddp=True
+- queue_use_scene_mask=True
+
+### 与梯度累加的配合
+- 梯度累加用于提高“有效 batch”稳定性。
+- 特征队列用于提高“负样本数量”。
+- 两者互补，可同时开启。
+
+### 边界与注意事项
+- 队列特征是历史快照，存在一定陈旧性（staleness），因此不建议一开始把队列设得过大。
+- scene mask 按“scene id 相同”掩码，不是按特征相似度阈值掩码。
+- 若极端情况下某样本可用负样本过少（例如队列很小且场景高度重复），可临时关闭 scene mask 做对照。
+- 队列特征必须 detach 后入队，不能反向回传到历史 step。
+
+### 后续升级路径
+- 第一步：先固定 queue_use_scene_mask 开关做 A/B 对照（True/False）。
+- 第二步：结合显存与稳定性再调 feature_queue_size 与 warmup。
+- 第三步：视资源情况叠加更大累加步数或更严格负样本策略。
+
+## DDP 启动稳定性补充（2026-06-22）
+在 offline_train + DDP + DataLoader 多进程场景下，若遇到：
+- TypeError: cannot pickle 'dict_keys' object
+
+已知根因是数据集中 eval_detection_configs.class_names 在部分环境下是 dict_keys 视图对象，spawn worker 时不可序列化。
+
+当前修复策略：
+- 在 CustomNuScenesDatasetV2 初始化阶段统一把该字段转换为 list。
+
+效果：
+- DDP 能正常越过 DataLoader worker 启动并进入反向传播。
