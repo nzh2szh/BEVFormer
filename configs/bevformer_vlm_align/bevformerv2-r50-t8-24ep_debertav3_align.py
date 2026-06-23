@@ -44,7 +44,7 @@ model = dict(
     spatial_bev_h=200,
     spatial_bev_w=200,
     gather_ddp=True,
-    use_feature_queue=True,
+    use_feature_queue=False,
     feature_queue_size=256,
     feature_queue_warmup_steps=500,
     queue_use_scene_mask=True,
@@ -84,7 +84,7 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=1e-4,
+    lr=5e-5,
     weight_decay=0.01,
 )
 optimizer_config = dict(

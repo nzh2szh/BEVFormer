@@ -279,6 +279,8 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         self.register_buffer('vision_queue', torch.zeros(self.feature_queue_size, proj_dims))
         self.register_buffer('text_queue_scene_id', torch.full((self.feature_queue_size,), -1, dtype=torch.long))
         self.register_buffer('vision_queue_scene_id', torch.full((self.feature_queue_size,), -1, dtype=torch.long))
+        self.register_buffer('text_queue_text_id', torch.full((self.feature_queue_size,), -1, dtype=torch.long))
+        self.register_buffer('vision_queue_text_id', torch.full((self.feature_queue_size,), -1, dtype=torch.long))
         self.register_buffer('queue_ptr', torch.zeros(1, dtype=torch.long))
         self.register_buffer('queue_valid_len', torch.zeros(1, dtype=torch.long))
         self.register_buffer('queue_step', torch.zeros(1, dtype=torch.long))
@@ -915,6 +917,19 @@ class BEVFormerDebertaAlign(BEVFormerV2):
             scene_ids = scene_ids.to(device=device)
         return scene_ids
 
+    def _text_to_id(self, text):
+        """Map text content to stable positive int64 id."""
+        raw = hashlib.blake2b(str(text).encode('utf-8'), digest_size=8).digest()
+        return int.from_bytes(raw, byteorder='big', signed=False) & 0x7FFFFFFFFFFFFFFF
+
+    def _resolve_text_ids(self, texts, device=None):
+        """Resolve text ids for batch samples used by queue mask."""
+        ids = [self._text_to_id(t) for t in texts]
+        text_ids = torch.tensor(ids, dtype=torch.long)
+        if device is not None:
+            text_ids = text_ids.to(device=device)
+        return text_ids
+
     def _encode_text(self, texts, device):
         """Encode text with frozen DeBERTa and trainable text projector.
 
@@ -1005,7 +1020,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         self.queue_valid_len[0] = min(qsize, int(self.queue_valid_len.item()) + bsz)
 
     @torch.no_grad()
-    def _enqueue_feature_queue(self, vision_feat, text_feat, scene_ids=None, gather_ddp=False):
+    def _enqueue_feature_queue(self, vision_feat, text_feat, scene_ids=None, text_ids=None, gather_ddp=False):
         """Update vision/text feature queues after each training step."""
         if not self.use_feature_queue:
             return
@@ -1017,6 +1032,10 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 queue_scene_ids = None
             else:
                 queue_scene_ids = self._gather_no_grad(scene_ids)
+            if text_ids is None:
+                queue_text_ids = None
+            else:
+                queue_text_ids = self._gather_no_grad(text_ids)
         else:
             queue_vision = vision_feat.detach()
             queue_text = text_feat.detach()
@@ -1024,9 +1043,83 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 queue_scene_ids = None
             else:
                 queue_scene_ids = scene_ids.detach()
+            if text_ids is None:
+                queue_text_ids = None
+            else:
+                queue_text_ids = text_ids.detach()
 
-        self._dequeue_and_enqueue('vision', queue_vision, scene_ids=queue_scene_ids)
-        self._dequeue_and_enqueue('text', queue_text, scene_ids=queue_scene_ids)
+        # Enqueue vision/text in lock-step so queue_ptr/queue_valid_len are
+        # advanced exactly once per training step.
+        qsize = self.vision_queue.shape[0]
+        queue_vision = queue_vision.to(device=self.vision_queue.device, dtype=self.vision_queue.dtype)
+        queue_text = queue_text.to(device=self.text_queue.device, dtype=self.text_queue.dtype)
+        queue_vision = F.normalize(queue_vision, dim=-1)
+        queue_text = F.normalize(queue_text, dim=-1)
+
+        bsz = min(queue_vision.shape[0], queue_text.shape[0])
+        if bsz <= 0:
+            return
+        queue_vision = queue_vision[:bsz]
+        queue_text = queue_text[:bsz]
+
+        if queue_scene_ids is None:
+            queue_scene_ids = torch.full((bsz,), -1, dtype=torch.long, device=self.vision_queue.device)
+        else:
+            queue_scene_ids = queue_scene_ids.to(device=self.vision_queue.device, dtype=torch.long)
+            if queue_scene_ids.shape[0] < bsz:
+                bsz = int(queue_scene_ids.shape[0])
+                if bsz <= 0:
+                    return
+                queue_vision = queue_vision[:bsz]
+                queue_text = queue_text[:bsz]
+                queue_scene_ids = queue_scene_ids[:bsz]
+            else:
+                queue_scene_ids = queue_scene_ids[:bsz]
+
+        if queue_text_ids is None:
+            queue_text_ids = torch.full((bsz,), -1, dtype=torch.long, device=self.vision_queue.device)
+        else:
+            queue_text_ids = queue_text_ids.to(device=self.vision_queue.device, dtype=torch.long)
+            if queue_text_ids.shape[0] < bsz:
+                bsz = int(queue_text_ids.shape[0])
+                if bsz <= 0:
+                    return
+                queue_vision = queue_vision[:bsz]
+                queue_text = queue_text[:bsz]
+                queue_scene_ids = queue_scene_ids[:bsz]
+                queue_text_ids = queue_text_ids[:bsz]
+            else:
+                queue_text_ids = queue_text_ids[:bsz]
+
+        if bsz > qsize:
+            queue_vision = queue_vision[-qsize:]
+            queue_text = queue_text[-qsize:]
+            queue_scene_ids = queue_scene_ids[-qsize:]
+            queue_text_ids = queue_text_ids[-qsize:]
+            bsz = qsize
+
+        ptr = int(self.queue_ptr.item())
+        first = min(qsize - ptr, bsz)
+
+        self.vision_queue[ptr:ptr + first] = queue_vision[:first]
+        self.text_queue[ptr:ptr + first] = queue_text[:first]
+        self.vision_queue_scene_id[ptr:ptr + first] = queue_scene_ids[:first]
+        self.text_queue_scene_id[ptr:ptr + first] = queue_scene_ids[:first]
+        self.vision_queue_text_id[ptr:ptr + first] = queue_text_ids[:first]
+        self.text_queue_text_id[ptr:ptr + first] = queue_text_ids[:first]
+
+        remain = bsz - first
+        if remain > 0:
+            self.vision_queue[:remain] = queue_vision[first:first + remain]
+            self.text_queue[:remain] = queue_text[first:first + remain]
+            self.vision_queue_scene_id[:remain] = queue_scene_ids[first:first + remain]
+            self.text_queue_scene_id[:remain] = queue_scene_ids[first:first + remain]
+            self.vision_queue_text_id[:remain] = queue_text_ids[first:first + remain]
+            self.text_queue_text_id[:remain] = queue_text_ids[first:first + remain]
+
+        ptr = (ptr + bsz) % qsize
+        self.queue_ptr[0] = ptr
+        self.queue_valid_len[0] = min(qsize, int(self.queue_valid_len.item()) + bsz)
 
     def _queue_ready(self):
         if not self.use_feature_queue:
@@ -1035,7 +1128,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
             return False
         return int(self.queue_step.item()) >= self.feature_queue_warmup_steps
 
-    def _contrastive_loss(self, vision_feat, text_feat, scene_ids=None, gather_ddp=False, use_queue=False):
+    def _contrastive_loss(self, vision_feat, text_feat, scene_ids=None, text_ids=None, gather_ddp=False, use_queue=False):
         """Compute symmetric InfoNCE loss (image->text and text->image).
 
         Args:
@@ -1077,6 +1170,21 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                     mask_t2i = local_scene_ids.unsqueeze(1).eq(vision_queue_scene_ids.unsqueeze(0))
                     queue_logits_i2t = queue_logits_i2t.masked_fill(mask_i2t, -1e4)
                     queue_logits_t2i = queue_logits_t2i.masked_fill(mask_t2i, -1e4)
+
+            # In trainval, different scenes can share identical descriptions.
+            # Mask same-text queue entries to avoid false negatives.
+            if text_ids is not None:
+                local_text_ids = text_ids.to(device=vision_feat.device, dtype=torch.long).view(-1)
+                if local_text_ids.shape[0] == vision_feat.shape[0]:
+                    text_queue_text_ids = self.text_queue_text_id[:qlen].detach().to(
+                        device=vision_feat.device, dtype=torch.long)
+                    vision_queue_text_ids = self.vision_queue_text_id[:qlen].detach().to(
+                        device=vision_feat.device, dtype=torch.long)
+
+                    text_mask_i2t = local_text_ids.unsqueeze(1).eq(text_queue_text_ids.unsqueeze(0))
+                    text_mask_t2i = local_text_ids.unsqueeze(1).eq(vision_queue_text_ids.unsqueeze(0))
+                    queue_logits_i2t = queue_logits_i2t.masked_fill(text_mask_i2t, -1e4)
+                    queue_logits_t2i = queue_logits_t2i.masked_fill(text_mask_t2i, -1e4)
 
             logits_i2t = torch.cat([logits_i2t, queue_logits_i2t], dim=1)
             logits_t2i = torch.cat([logits_t2i, queue_logits_t2i], dim=1)
@@ -1142,11 +1250,30 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 scene_text=scene_text,
                 scene_tokens=scene_tokens,
             )
+            text_ids = self._resolve_text_ids(texts, device=device)
             text_feat = self._encode_text(texts, device=device)
+
+            # Queue entries collected during warmup can be very stale when
+            # warmup is long (e.g. trainval). Reset once at the transition
+            # step to avoid a sudden loss/metric collapse.
+            if (
+                self.use_feature_queue
+                and self.feature_queue_warmup_steps > 0
+                and int(self.queue_step.item()) == self.feature_queue_warmup_steps
+                and int(self.queue_valid_len.item()) > 0
+            ):
+                self.queue_ptr.zero_()
+                self.queue_valid_len.zero_()
+                self.text_queue_scene_id.fill_(-1)
+                self.vision_queue_scene_id.fill_(-1)
+                self.text_queue_text_id.fill_(-1)
+                self.vision_queue_text_id.fill_(-1)
+
             loss, i2t_top1, t2i_top1, _ = self._contrastive_loss(
                 vision_feat,
                 text_feat,
                 scene_ids=scene_ids,
+                text_ids=text_ids,
                 gather_ddp=self.gather_ddp,
                 use_queue=self.use_feature_queue,
             )
@@ -1155,6 +1282,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 vision_feat,
                 text_feat,
                 scene_ids=scene_ids,
+                text_ids=text_ids,
                 gather_ddp=self.gather_ddp,
             )
             self.queue_step.add_(1)

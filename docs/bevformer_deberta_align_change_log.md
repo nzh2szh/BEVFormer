@@ -867,7 +867,7 @@ BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
 
 trainval：
 START_EPOCH=1 \
-END_EPOCH=5 \
+END_EPOCH=1 \
 DATASET_PROFILE=trainval \
 CUDA_VISIBLE_DEVICES=0,1,2 \
 BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
