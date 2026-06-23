@@ -873,6 +873,39 @@ CUDA_VISIBLE_DEVICES=0,1,2 \
 BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
 ./tools/train_val_epoch_serial_ddp.sh
 
+多PC，需要PC之间保持代码版本和路径、数据集路径、中间结果（work_dirs）一致：
+主节点：
+NNODES=2 \
+NODE_RANK=0 \
+MASTER_ADDR=192.168.103.2 \
+MASTER_PORT=29501 \
+NPROC_PER_NODE=3 \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+ENABLE_RSYNC_SYNC=true \
+RSYNC_PASSWORD_FILE=/etc/rsync.password \
+RSYNC_TARGET_IP=192.168.103.3 \
+RSYNC_TARGET_USER=rsync_user \
+RSYNC_TARGET_PATH=backup_module/ \
+START_EPOCH=1 \
+END_EPOCH=3 \
+DATASET_PROFILE=trainval \
+BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
+./tools/train_val_epoch_serial_ddp.sh
+
+从节点:
+NNODES=2 \
+NODE_RANK=1 \
+MASTER_ADDR=192.168.103.2 \
+MASTER_PORT=29501 \
+NPROC_PER_NODE=3 \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+ENABLE_RSYNC_SYNC=true \
+START_EPOCH=1 \
+END_EPOCH=3 \
+DATASET_PROFILE=trainval \
+BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
+./tools/train_val_epoch_serial_ddp.sh
+
 
 可直接用这条命令就行（可写到任意绝对路径，避免 work_dir 权限问题）：
 python tools/export_train_val_compare.py \

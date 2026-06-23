@@ -259,3 +259,14 @@ tools: [ "#codebase", "#terminal" ]
 
 效果：
 - DDP 能正常越过 DataLoader worker 启动并进入反向传播。
+
+## 多机多卡模式
+
+### 只同步多机共同训练的必要文件
+- 每个 epoch 仅同步 epoch_${epoch}.pth（这是下一轮 resume 必需文件）。
+- 默认不同步 align_trainable_epoch_*.pth / latest.pth。
+
+### 使用 rsync password-file（daemon 模式）支持多机串行多轮 epoch
+- 在脚本内加入自动同步逻辑（仅 rank0 执行）。
+- 非 rank0 节点在下一轮 resume 前会等待断点文件到位，避免“文件未同步就报错”。
+

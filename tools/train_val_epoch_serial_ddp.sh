@@ -34,8 +34,24 @@ END_EPOCH="${END_EPOCH:-1}"
 
 # DDP settings.
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-3}"
+TORCHRUN_RDZV_TIMEOUT="${TORCHRUN_RDZV_TIMEOUT:-7200}"
+RDZV_ID="${RDZV_ID:-bevformer_align_ddp}"
+
+# Optional rsync-daemon checkpoint sync (for non-shared WORK_DIR multi-node runs).
+# Only required resume checkpoints are synced: epoch_${epoch}.pth
+ENABLE_RSYNC_SYNC="${ENABLE_RSYNC_SYNC:-false}"
+RSYNC_PASSWORD_FILE="${RSYNC_PASSWORD_FILE:-/etc/rsync.password}"
+RSYNC_TARGET_IP="${RSYNC_TARGET_IP:-192.168.103.3}"
+RSYNC_TARGET_USER="${RSYNC_TARGET_USER:-rsync_user}"
+RSYNC_TARGET_PATH="${RSYNC_TARGET_PATH:-backup_module/}"
+RSYNC_EXTRA_OPTS="${RSYNC_EXTRA_OPTS:--avz}"
+RESUME_WAIT_SECONDS="${RESUME_WAIT_SECONDS:-3600}"
+RESUME_WAIT_INTERVAL="${RESUME_WAIT_INTERVAL:-10}"
 
 # Memory allocator setting for PyTorch CUDA.
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128,garbage_collection_threshold:0.8}"
@@ -82,6 +98,9 @@ echo "[INFO] Dataset  : ${DATASET_PROFILE}"
 echo "[INFO] Work dir : ${WORK_DIR}"
 echo "[INFO] Epochs   : ${START_EPOCH} -> ${END_EPOCH}"
 echo "[INFO] DDP GPUs : ${CUDA_VISIBLE_DEVICES} (nproc=${NPROC_PER_NODE})"
+echo "[INFO] DDP nodes: nnodes=${NNODES}, node_rank=${NODE_RANK}"
+echo "[INFO] Rendezvous: ${MASTER_ADDR}:${MASTER_PORT} (rdzv_id=${RDZV_ID}, timeout=${TORCHRUN_RDZV_TIMEOUT}s)"
+echo "[INFO] Rsync sync: enable=${ENABLE_RSYNC_SYNC}, target=${RSYNC_TARGET_USER}@${RSYNC_TARGET_IP}::${RSYNC_TARGET_PATH}"
 echo "[INFO] Scene json: ${SCENE_JSON}"
 echo "[INFO] Train ann : ${TRAIN_ANN}"
 echo "[INFO] Val ann   : ${VAL_ANN}"
@@ -95,6 +114,54 @@ if [[ "${START_EPOCH}" -gt "${END_EPOCH}" ]]; then
   exit 1
 fi
 
+wait_for_resume_ckpt() {
+  local ckpt="$1"
+  local waited=0
+  while [[ ! -f "${ckpt}" ]]; do
+    if [[ "${waited}" -ge "${RESUME_WAIT_SECONDS}" ]]; then
+      echo "[ERROR] Timed out waiting for resume checkpoint: ${ckpt}"
+      echo "[ERROR] waited=${waited}s, RESUME_WAIT_SECONDS=${RESUME_WAIT_SECONDS}"
+      return 1
+    fi
+    if (( waited % 60 == 0 )); then
+      echo "[INFO] Waiting for checkpoint sync: ${ckpt} (waited ${waited}s)"
+    fi
+    sleep "${RESUME_WAIT_INTERVAL}"
+    waited=$((waited + RESUME_WAIT_INTERVAL))
+  done
+  return 0
+}
+
+sync_required_ckpt_to_peer() {
+  local ckpt="$1"
+  if [[ "${NNODES}" -le 1 ]]; then
+    return 0
+  fi
+  if [[ "${NODE_RANK}" -ne 0 ]]; then
+    return 0
+  fi
+  if [[ "${ENABLE_RSYNC_SYNC}" != "true" ]]; then
+    return 0
+  fi
+  if ! command -v rsync >/dev/null 2>&1; then
+    echo "[ERROR] ENABLE_RSYNC_SYNC=true but rsync command not found."
+    return 1
+  fi
+  if [[ ! -f "${RSYNC_PASSWORD_FILE}" ]]; then
+    echo "[ERROR] ENABLE_RSYNC_SYNC=true but RSYNC_PASSWORD_FILE not found: ${RSYNC_PASSWORD_FILE}"
+    return 1
+  fi
+  if [[ ! -f "${ckpt}" ]]; then
+    echo "[ERROR] Required checkpoint not found for sync: ${ckpt}"
+    return 1
+  fi
+
+  echo "[INFO] Sync required checkpoint to peer: ${ckpt}"
+  rsync ${RSYNC_EXTRA_OPTS} --password-file="${RSYNC_PASSWORD_FILE}" \
+    "${ckpt}" \
+    "${RSYNC_TARGET_USER}@${RSYNC_TARGET_IP}::${RSYNC_TARGET_PATH}"
+}
+
 for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
   prev_epoch=$((epoch - 1))
 
@@ -103,8 +170,13 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
 
   train_cmd=(
     torchrun
+    --nnodes="${NNODES}"
+    --node_rank="${NODE_RANK}"
     --nproc_per_node="${NPROC_PER_NODE}"
-    --master_port="${MASTER_PORT}"
+    --rdzv_backend=c10d
+    --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}"
+    --rdzv_id="${RDZV_ID}"
+    --rdzv_conf "timeout=${TORCHRUN_RDZV_TIMEOUT}"
     tools/train.py
     "${CONFIG}"
     --launcher pytorch
@@ -114,6 +186,9 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
 
   if [[ "${epoch}" -gt 1 ]]; then
     resume_ckpt="${WORK_DIR}/epoch_${prev_epoch}.pth"
+    if [[ "${NNODES}" -gt 1 && "${NODE_RANK}" -ne 0 && "${ENABLE_RSYNC_SYNC}" == "true" ]]; then
+      wait_for_resume_ckpt "${resume_ckpt}"
+    fi
     if [[ ! -f "${resume_ckpt}" ]]; then
       echo "[ERROR] Resume checkpoint not found: ${resume_ckpt}"
       exit 1
@@ -141,6 +216,13 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
   PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}" \
   "${train_cmd[@]}"
 
+  # In multi-node runs, only rank0 performs validation/export/write-back.
+  # Other nodes return to the next epoch training command and wait at rendezvous.
+  if [[ "${NNODES}" -gt 1 && "${NODE_RANK}" -ne 0 ]]; then
+    echo "[INFO] node_rank=${NODE_RANK}: skip validate/export for epoch ${epoch}; wait for next train rendezvous."
+    continue
+  fi
+
   align_ckpt="${WORK_DIR}/align_trainable_epoch_${epoch}.pth"
   if [[ ! -f "${align_ckpt}" ]]; then
     echo "[ERROR] Align checkpoint not found after training: ${align_ckpt}"
@@ -148,6 +230,9 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
     ls -1 "${WORK_DIR}"/align_trainable_epoch_*.pth 2>/dev/null || true
     exit 1
   fi
+
+  # Keep non-shared multi-node WORK_DIR in sync for next epoch resume.
+  sync_required_ckpt_to_peer "${WORK_DIR}/epoch_${epoch}.pth"
 
   echo "[INFO] ===== Epoch ${epoch}: validate ====="
   val_log="${WORK_DIR}/${VAL_LOG_SUBDIR}/epoch_${epoch}.log"
@@ -288,4 +373,8 @@ EOF
 done
 
 echo ""
-echo "[INFO] Done. Serial train+val finished for epochs ${START_EPOCH}..${END_EPOCH}."
+if [[ "${NNODES}" -gt 1 && "${NODE_RANK}" -ne 0 ]]; then
+  echo "[INFO] Done. Worker node_rank=${NODE_RANK} finished training loop for epochs ${START_EPOCH}..${END_EPOCH}."
+else
+  echo "[INFO] Done. Serial train+val finished for epochs ${START_EPOCH}..${END_EPOCH}."
+fi

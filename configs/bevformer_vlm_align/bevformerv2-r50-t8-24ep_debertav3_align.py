@@ -44,9 +44,9 @@ model = dict(
     spatial_bev_h=200,
     spatial_bev_w=200,
     gather_ddp=True,
-    use_feature_queue=False,
-    feature_queue_size=256,
-    feature_queue_warmup_steps=500,
+    use_feature_queue=True,
+    feature_queue_size=64,
+    feature_queue_warmup_steps=2000,
     queue_use_scene_mask=True,
     # Enable BF16 runtime for frozen backbones and alignment head.
     use_bf16_amp=True,
@@ -90,14 +90,14 @@ optimizer = dict(
 optimizer_config = dict(
     type='GradientCumulativeOptimizerHook',
     cumulative_iters=4,   # 梯度累加步数
-    grad_clip=dict(max_norm=10, norm_type=2),
+    grad_clip=dict(max_norm=1.0, norm_type=2),
 )
 
 lr_config = dict(
     _delete_=True,
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=500,
+    warmup_iters=2000,
     warmup_ratio=1.0 / 10,
     min_lr_ratio=1e-4,
 )
