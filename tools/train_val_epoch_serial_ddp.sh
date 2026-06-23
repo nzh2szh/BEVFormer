@@ -41,6 +41,12 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-3}"
 TORCHRUN_RDZV_TIMEOUT="${TORCHRUN_RDZV_TIMEOUT:-7200}"
 RDZV_ID="${RDZV_ID:-bevformer_align_ddp}"
+TORCHRUN_RDZV_CONF_EXTRA="${TORCHRUN_RDZV_CONF_EXTRA:-}"
+
+# Network interface binding for stable multi-node rendezvous/NCCL.
+GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-}"
+NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-}"
+REQUIRE_SOCKET_IFNAME="${REQUIRE_SOCKET_IFNAME:-true}"
 
 # Optional rsync-daemon checkpoint sync (for non-shared WORK_DIR multi-node runs).
 # Only required resume checkpoints are synced: epoch_${epoch}.pth
@@ -83,6 +89,9 @@ COMPARE_TRAIN_LOG="${COMPARE_TRAIN_LOG:-}"
 # Run validation on one GPU by default (usually less contention and simpler).
 VAL_CUDA_VISIBLE_DEVICES="${VAL_CUDA_VISIBLE_DEVICES:-$(echo "${CUDA_VISIBLE_DEVICES}" | cut -d',' -f1)}"
 
+# Epoch-range consistency marker used by multi-node startup guard.
+EPOCH_RANGE_MARKER="${WORK_DIR}/.ddp_epoch_range.env"
+
 mkdir -p "${WORK_DIR}"
 mkdir -p "${WORK_DIR}/${VAL_LOG_SUBDIR}"
 mkdir -p "${WORK_DIR}/${VAL_LOAD_REPORT_SUBDIR}"
@@ -108,10 +117,22 @@ echo "[INFO] Val logs  : ${WORK_DIR}/${VAL_LOG_SUBDIR}"
 echo "[INFO] Val summary: ${summary_path}"
 echo "[INFO] Val metrics json: ${WORK_DIR}/${VAL_METRICS_SUBDIR}"
 echo "[INFO] Auto compare export: ${AUTO_EXPORT_COMPARE}"
+if [[ "${NNODES}" -gt 1 ]]; then
+  echo "[INFO] GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-<empty>}"
+  echo "[INFO] NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-<empty>}"
+fi
 
 if [[ "${START_EPOCH}" -gt "${END_EPOCH}" ]]; then
   echo "[ERROR] START_EPOCH (${START_EPOCH}) must be <= END_EPOCH (${END_EPOCH})"
   exit 1
+fi
+
+if [[ "${NNODES}" -gt 1 && "${REQUIRE_SOCKET_IFNAME}" == "true" ]]; then
+  if [[ -z "${GLOO_SOCKET_IFNAME}" || -z "${NCCL_SOCKET_IFNAME}" ]]; then
+    echo "[ERROR] Multi-node run requires explicit NIC binding."
+    echo "[ERROR] Please set both GLOO_SOCKET_IFNAME and NCCL_SOCKET_IFNAME (e.g. eno2)."
+    exit 1
+  fi
 fi
 
 wait_for_resume_ckpt() {
@@ -162,6 +183,97 @@ sync_required_ckpt_to_peer() {
     "${RSYNC_TARGET_USER}@${RSYNC_TARGET_IP}::${RSYNC_TARGET_PATH}"
 }
 
+sync_epoch_range_marker_to_peer() {
+  local marker="$1"
+  if [[ "${NNODES}" -le 1 ]]; then
+    return 0
+  fi
+  if [[ "${NODE_RANK}" -ne 0 ]]; then
+    return 0
+  fi
+  if [[ "${ENABLE_RSYNC_SYNC}" != "true" ]]; then
+    return 0
+  fi
+  if ! command -v rsync >/dev/null 2>&1; then
+    echo "[ERROR] ENABLE_RSYNC_SYNC=true but rsync command not found."
+    return 1
+  fi
+  if [[ ! -f "${RSYNC_PASSWORD_FILE}" ]]; then
+    echo "[ERROR] ENABLE_RSYNC_SYNC=true but RSYNC_PASSWORD_FILE not found: ${RSYNC_PASSWORD_FILE}"
+    return 1
+  fi
+  if [[ ! -f "${marker}" ]]; then
+    echo "[ERROR] Epoch-range marker not found for sync: ${marker}"
+    return 1
+  fi
+
+  echo "[INFO] Sync epoch-range marker to peer: ${marker}"
+  rsync ${RSYNC_EXTRA_OPTS} --password-file="${RSYNC_PASSWORD_FILE}" \
+    "${marker}" \
+    "${RSYNC_TARGET_USER}@${RSYNC_TARGET_IP}::${RSYNC_TARGET_PATH}"
+}
+
+wait_for_epoch_range_marker() {
+  local marker="$1"
+  local waited=0
+  while [[ ! -f "${marker}" ]]; do
+    if [[ "${waited}" -ge "${RESUME_WAIT_SECONDS}" ]]; then
+      echo "[ERROR] Timed out waiting for epoch-range marker: ${marker}"
+      echo "[ERROR] waited=${waited}s, RESUME_WAIT_SECONDS=${RESUME_WAIT_SECONDS}"
+      return 1
+    fi
+    if (( waited % 60 == 0 )); then
+      echo "[INFO] Waiting for epoch-range marker: ${marker} (waited ${waited}s)"
+    fi
+    sleep "${RESUME_WAIT_INTERVAL}"
+    waited=$((waited + RESUME_WAIT_INTERVAL))
+  done
+  return 0
+}
+
+prepare_and_validate_epoch_range_marker() {
+  local marker="$1"
+
+  if [[ "${NNODES}" -le 1 ]]; then
+    return 0
+  fi
+
+  if [[ "${NODE_RANK}" -eq 0 ]]; then
+    cat > "${marker}" <<EOF
+START_EPOCH=${START_EPOCH}
+END_EPOCH=${END_EPOCH}
+DATASET_PROFILE=${DATASET_PROFILE}
+RDZV_ID=${RDZV_ID}
+EOF
+    sync_epoch_range_marker_to_peer "${marker}"
+    return 0
+  fi
+
+  if [[ "${ENABLE_RSYNC_SYNC}" == "true" ]]; then
+    wait_for_epoch_range_marker "${marker}"
+  fi
+
+  if [[ ! -f "${marker}" ]]; then
+    echo "[WARN] Epoch-range marker is unavailable on node_rank=${NODE_RANK}: ${marker}"
+    echo "[WARN] Skip strict epoch-range cross-node validation for this run."
+    return 0
+  fi
+
+  marker_start="$(grep -E '^START_EPOCH=' "${marker}" | head -1 | cut -d'=' -f2-)"
+  marker_end="$(grep -E '^END_EPOCH=' "${marker}" | head -1 | cut -d'=' -f2-)"
+  marker_profile="$(grep -E '^DATASET_PROFILE=' "${marker}" | head -1 | cut -d'=' -f2-)"
+  marker_rdzv_id="$(grep -E '^RDZV_ID=' "${marker}" | head -1 | cut -d'=' -f2-)"
+
+  if [[ "${marker_start}" != "${START_EPOCH}" || "${marker_end}" != "${END_EPOCH}" || "${marker_profile}" != "${DATASET_PROFILE}" || "${marker_rdzv_id}" != "${RDZV_ID}" ]]; then
+    echo "[ERROR] Cross-node startup mismatch detected on node_rank=${NODE_RANK}."
+    echo "[ERROR] Local : START_EPOCH=${START_EPOCH}, END_EPOCH=${END_EPOCH}, DATASET_PROFILE=${DATASET_PROFILE}, RDZV_ID=${RDZV_ID}"
+    echo "[ERROR] Marker: START_EPOCH=${marker_start}, END_EPOCH=${marker_end}, DATASET_PROFILE=${marker_profile}, RDZV_ID=${marker_rdzv_id}"
+    exit 1
+  fi
+}
+
+prepare_and_validate_epoch_range_marker "${EPOCH_RANGE_MARKER}"
+
 for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
   prev_epoch=$((epoch - 1))
 
@@ -176,7 +288,7 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
     --rdzv_backend=c10d
     --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}"
     --rdzv_id="${RDZV_ID}"
-    --rdzv_conf "timeout=${TORCHRUN_RDZV_TIMEOUT}"
+    --rdzv_conf "timeout=${TORCHRUN_RDZV_TIMEOUT},is_host=$([[ "${NODE_RANK}" -eq 0 ]] && echo true || echo false)${TORCHRUN_RDZV_CONF_EXTRA:+,${TORCHRUN_RDZV_CONF_EXTRA}}"
     tools/train.py
     "${CONFIG}"
     --launcher pytorch

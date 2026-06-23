@@ -975,13 +975,15 @@ MASTER_ADDR=192.168.103.2 \
 MASTER_PORT=29501 \
 NPROC_PER_NODE=3 \
 CUDA_VISIBLE_DEVICES=0,1,2 \
+GLOO_SOCKET_IFNAME=eno2 \
+NCCL_SOCKET_IFNAME=eno2 \
 ENABLE_RSYNC_SYNC=true \
 RSYNC_PASSWORD_FILE=/etc/rsync.password \
 RSYNC_TARGET_IP=192.168.103.3 \
 RSYNC_TARGET_USER=rsync_user \
 RSYNC_TARGET_PATH=backup_module/ \
 START_EPOCH=1 \
-END_EPOCH=3 \
+END_EPOCH=2 \
 DATASET_PROFILE=trainval \
 BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
 ./tools/train_val_epoch_serial_ddp.sh
@@ -993,12 +995,28 @@ MASTER_ADDR=192.168.103.2 \
 MASTER_PORT=29501 \
 NPROC_PER_NODE=3 \
 CUDA_VISIBLE_DEVICES=0,1,2 \
+GLOO_SOCKET_IFNAME=eno2 \
+NCCL_SOCKET_IFNAME=eno2 \
 ENABLE_RSYNC_SYNC=true \
 START_EPOCH=1 \
-END_EPOCH=3 \
+END_EPOCH=2 \
 DATASET_PROFILE=trainval \
 BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
 ./tools/train_val_epoch_serial_ddp.sh
+
+主节点启动后立刻检查监听（修正版）：
+
+1) 在和 torchrun 同一个网络命名空间里检查（容器里启动就到容器里查）。
+2) 先看端口是否监听：
+ss -ltn "sport = :29501"
+3) 需要看进程再用：
+sudo ss -ltnp "sport = :29501"
+
+补充：
+
+- 只用 ss -lntp | grep 29501 容易因权限或输出格式误判。
+- 如果训练在 Docker 容器中，去宿主机执行 ss 可能看不到容器内监听。
+- 从节点连通性检查应打到 MASTER_ADDR（这里是 192.168.103.2），不是 RSYNC_TARGET_IP。
 
 
 可直接用这条命令就行（可写到任意绝对路径，避免 work_dir 权限问题）：
