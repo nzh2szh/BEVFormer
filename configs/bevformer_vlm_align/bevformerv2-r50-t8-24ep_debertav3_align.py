@@ -118,7 +118,15 @@ custom_hooks = [
         by_epoch=True,
         interval=1,
         filename_tmpl='align_trainable_epoch_{}.pth',
-    )
+    ),
+    dict(
+        type='DebugTrainableUpdateHook',
+        interval=200,
+        param_keywords=['vision_projector', 'text_projector', 'logit_scale', 'temporal_encoder'],
+        max_params=20,
+        log_detail=False,
+        log_summary=True,
+    ),
 ]
 
 # Use no-validate in tools/train.py, or provide a custom retrieval evaluator.

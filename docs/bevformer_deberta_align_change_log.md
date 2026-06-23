@@ -648,6 +648,100 @@ queue_use_scene_mask=True
 
 --------------------------------------------------------------------------------------------------------
 
+date: 202606232100
+
+现在改过的脚本逻辑：
+
+串行 val 只在 rank0（NODE_RANK=0）执行。
+画图/报表导出也只在 rank0 执行。
+因此这些结果文件只会写到 rank0 的 WORK_DIR。
+rank1 的行为是：
+
+只参与训练阶段 DDP
+训练后跳过 validate/export，等待下一轮训练 rendezvous
+所以你看到的 val_logs、val_metrics_json、val_metrics.tsv、train_val_compare.tsv/png/md 都在 rank0 那边。
+如果需要 rank1 也有一份，就训练后再从 rank0 同步这些产物过去即可。
+
+只同步多机共同训练的必要文件
+每个 epoch 仅同步 epoch_${epoch}.pth（这是下一轮 resume 必需文件）。
+不再默认同步 align_trainable_epoch_*.pth / latest.pth。
+使用 rsync password-file（daemon 模式）支持多机串行多轮 epoch
+已在脚本内加入自动同步逻辑（仅 rank0 执行）。
+非 rank0 节点在下一轮 resume 前会等待断点文件到位，避免“文件未同步就报错”。
+
+新增可配置参数（含默认值）：
+
+ENABLE_RSYNC_SYNC=false
+RSYNC_PASSWORD_FILE=/etc/rsync.password
+RSYNC_TARGET_IP=192.168.103.3
+RSYNC_TARGET_USER=rsync_user
+RSYNC_TARGET_PATH=backup_module/
+RSYNC_EXTRA_OPTS=-avz
+RESUME_WAIT_SECONDS=3600
+RESUME_WAIT_INTERVAL=10
+
+epoch_N.pth 是续训硬依赖
+下一轮训练 --resume-from 用的是这个文件。
+所以它必须同步，这也是现在只同步它的原因。
+位置见 train_val_epoch_serial_ddp.sh:188
+align_trainable_epoch_N.pth 主要用于验证/导出
+你现在多机模式下只在 rank0 做 val 和报表。
+rank1 不做 val，因此 rank1 不需要这份文件也能参与下一轮训练。
+位置见 train_val_epoch_serial_ddp.sh:221
+latest.pth 不是当前续训路径必需
+你的脚本续训依赖的是明确的 epoch_${prev}.pth，不是 latest.pth。
+所以不同步 latest.pth 不会卡住当前串行多轮 epoch 训练。
+
+
+
+按“一个 epoch 结束后”把两个 rank 的时序拆开讲。
+
+当前脚本里的关键逻辑点：
+
+rank0 推送：sync_required_ckpt_to_peer "${WORK_DIR}/epoch_${epoch}.pth"
+rank1 等待：下一轮开始前 wait_for_resume_ckpt "${WORK_DIR}/epoch_${prev_epoch}.pth"
+rank1 跳过 val：if [[ NNODES>1 && NODE_RANK!=0 ]]; then continue
+
+执行时序（以 epoch=2 结束为例）
+
+两边先完成 epoch=2 的 DDP 训练
+torchrun 训练阶段是同步的，直到两边都退出本轮 train 命令。
+
+rank0 训练返回后先做 rsync
+rank0 调用 sync_required_ckpt_to_peer，只传 epoch_2.pth。
+这个 rsync 命令是前台阻塞执行：没传完不会返回。
+所以 rank0 不会立刻去做 val 或下一轮。
+
+rank1 训练返回后不做 val
+rank1 命中“多机非0号节点跳过验证”的分支，直接 continue 到下一轮循环。
+它不会在本轮做任何 rsync 推送，也不会写 val 报表。
+
+到 epoch=3 开始时，rank1 先检查 resume 文件
+因为 epoch>1，rank1 会先执行 wait_for_resume_ckpt WORK_DIR/epoch_2.pth（仅在 ENABLE_RSYNC_SYNC=true 时）。
+如果文件已到位，立即继续；如果还没到，会按 RESUME_WAIT_INTERVAL 轮询，最多等 RESUME_WAIT_SECONDS。
+超时就报错退出，防止拿不到断点却硬跑。
+
+rank0 在 rsync 完成后才继续
+rank0 接着做本轮 val（只 rank0 做）。
+val 完后进入下一轮，读取同一个 epoch_2.pth 做 --resume-from。
+此时 rank1 通常也已经等到该文件，两个节点能在下一次 torchrun rendezvous 汇合。
+
+为什么这样设计是安全的:
+
+续训必需文件只有 epoch_N.pth，只同步它就够下一轮 train。
+rsync 阻塞保证 rank0 不会“还没传完就进入后续逻辑”。
+rank1 有显式等待，不会因为文件慢到而直接失败。
+val 只在 rank0，避免多节点重复验证、重复写报表冲突。
+
+边界与注意点:
+
+这个机制默认是“rank0 -> 一个目标节点（你配置的 RSYNC_TARGET_IP）”。
+如果未来是 3+ 节点，需要扩展为推送到多个目标，或改共享存储。
+如果 rank1 的 WORK_DIR 与 rsync 落地路径不一致，等待会一直看不到文件。
+如果不用 rsync（ENABLE_RSYNC_SYNC=false），则要你自己保证 rank1 上 epoch_N.pth 已存在。
+
+--------------------------------------------------------------------------------------------------------
+
 COMMAND:
 
 - offline_extract_bev:
