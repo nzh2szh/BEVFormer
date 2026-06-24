@@ -71,6 +71,7 @@ TRAIN_SAMPLES_PER_GPU="${TRAIN_SAMPLES_PER_GPU:-1}"
 TRAIN_WORKERS_PER_GPU="${TRAIN_WORKERS_PER_GPU:-2}"
 VAL_SAMPLES_PER_GPU="${VAL_SAMPLES_PER_GPU:-1}"
 VAL_WORKERS_PER_GPU="${VAL_WORKERS_PER_GPU:-2}"
+OFFLINE_UNIQUE_ANCHOR="${OFFLINE_UNIQUE_ANCHOR:-false}"
 VAL_LOG_SUBDIR="${VAL_LOG_SUBDIR:-val_logs}"
 VAL_LOAD_REPORT_SUBDIR="${VAL_LOAD_REPORT_SUBDIR:-align_val_load_reports}"
 VAL_SUMMARY_FILE="${VAL_SUMMARY_FILE:-val_metrics.tsv}"
@@ -118,6 +119,7 @@ echo "[INFO] Rsync sync: enable=${ENABLE_RSYNC_SYNC}, target=${RSYNC_TARGET_USER
 echo "[INFO] Scene json: ${SCENE_JSON}"
 echo "[INFO] Train ann : ${TRAIN_ANN}"
 echo "[INFO] Val ann   : ${VAL_ANN}"
+echo "[INFO] Unique anchor: ${OFFLINE_UNIQUE_ANCHOR}"
 echo "[INFO] Val logs  : ${WORK_DIR}/${VAL_LOG_SUBDIR}"
 echo "[INFO] Val summary: ${summary_path}"
 echo "[INFO] Val metrics json: ${WORK_DIR}/${VAL_METRICS_SUBDIR}"
@@ -284,6 +286,7 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
 
   echo ""
   echo "[INFO] ===== Epoch ${epoch}: train ====="
+  echo "[INFO] Epoch ${epoch} mode: offline_unique_anchor=${OFFLINE_UNIQUE_ANCHOR}"
 
   train_cmd=(
     torchrun
@@ -350,6 +353,7 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
     data.train.ann_file="${TRAIN_ANN}"
     data.train.mono_cfg=None
     data.train.offline_meta_only=True
+    data.train.offline_unique_anchor="${OFFLINE_UNIQUE_ANCHOR}"
     data.samples_per_gpu="${TRAIN_SAMPLES_PER_GPU}"
     data.workers_per_gpu="${TRAIN_WORKERS_PER_GPU}"
     data.persistent_workers=False
@@ -381,6 +385,7 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
   sync_required_ckpt_to_peer "${WORK_DIR}/epoch_${epoch}.pth"
 
   echo "[INFO] ===== Epoch ${epoch}: validate ====="
+  echo "[INFO] Epoch ${epoch} mode: offline_unique_anchor=${OFFLINE_UNIQUE_ANCHOR}"
   val_log="${WORK_DIR}/${VAL_LOG_SUBDIR}/epoch_${epoch}.log"
   load_report="${WORK_DIR}/${VAL_LOAD_REPORT_SUBDIR}/align_trainable_epoch_${epoch}.json"
   metrics_json="${WORK_DIR}/${VAL_METRICS_SUBDIR}/epoch_${epoch}.json"
@@ -389,6 +394,7 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
     model.offline_split=val
     model.scene_json="${SCENE_JSON}"
     data.val.offline_meta_only=True
+    data.val.offline_unique_anchor="${OFFLINE_UNIQUE_ANCHOR}"
   )
   if [[ -n "${VAL_ANN}" ]]; then
     val_cfg_opts+=(data.val.ann_file="${VAL_ANN}")

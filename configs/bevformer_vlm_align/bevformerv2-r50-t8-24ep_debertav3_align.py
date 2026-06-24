@@ -46,7 +46,7 @@ model = dict(
     gather_ddp=True,
     use_feature_queue=False,
     feature_queue_size=32,
-    feature_queue_warmup_steps=2000,
+    feature_queue_warmup_steps=50,
     queue_use_scene_mask=True,
     # Enable BF16 runtime for frozen backbones and alignment head.
     use_bf16_amp=True,
@@ -73,7 +73,7 @@ data = dict(
         frames=frames,
         # Optional: one anchor per non-overlap 40-frame chunk in offline_meta_only
         # mode, so each real frame is consumed at most once per epoch.
-        offline_unique_anchor=False,
+        offline_unique_anchor=True,
         # If True, drop tail chunk shorter than len(frames). If False, tail is
         # padded by repeating its last frame index.
         offline_drop_last_chunk=False,
@@ -97,12 +97,12 @@ lr_config = dict(
     _delete_=True,
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=2000,
+    warmup_iters=50,
     warmup_ratio=1.0 / 10,
     min_lr_ratio=1e-4,
 )
 
-total_epochs = 1
+total_epochs = 20
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 
 # Save only alignment trainable weights, not full model checkpoints.
