@@ -66,6 +66,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                  feature_queue_size=128,
                  feature_queue_warmup_steps=50,
                  queue_use_scene_mask=False,
+                 use_multi_positive=True,
                  use_bf16_amp=True,
                  run_mode='online',
                  offline_bev_dir='',
@@ -118,6 +119,9 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 before queue negatives are used in loss.
             queue_use_scene_mask (bool): Whether to mask queue negatives from
                 the same scene as current sample when computing logits.
+            use_multi_positive (bool): Whether to optimize multi-positive
+                InfoNCE where samples sharing scene/text are treated as
+                positives instead of negatives.
                         run_mode (str): Runtime mode for compatibility scenarios.
                                 Supported values:
                                 - origin: original mode, extract BEV features online.
@@ -172,6 +176,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         self.feature_queue_size = int(feature_queue_size)
         self.feature_queue_warmup_steps = int(feature_queue_warmup_steps)
         self.queue_use_scene_mask = queue_use_scene_mask
+        self.use_multi_positive = use_multi_positive
         self.use_bf16_amp = use_bf16_amp
         self.run_mode = run_mode
         self.offline_bev_dir = offline_bev_dir
@@ -1128,6 +1133,32 @@ class BEVFormerDebertaAlign(BEVFormerV2):
             return False
         return int(self.queue_step.item()) >= self.feature_queue_warmup_steps
 
+    def _pairwise_valid_equal_mask(self, left_ids, right_ids):
+        """Build pairwise equality mask and ignore unknown ids (-1)."""
+        if left_ids is None or right_ids is None:
+            return None
+        left_ids = left_ids.view(-1)
+        right_ids = right_ids.view(-1)
+        eq_mask = left_ids.unsqueeze(1).eq(right_ids.unsqueeze(0))
+        valid_mask = left_ids.unsqueeze(1).ge(0) & right_ids.unsqueeze(0).ge(0)
+        return eq_mask & valid_mask
+
+    def _multi_positive_infonce(self, logits, positive_mask):
+        """Compute multi-positive InfoNCE from logits and positive mask."""
+        valid_rows = positive_mask.any(dim=1)
+        if not valid_rows.any():
+            # Fallback for numerical safety; should not happen because diagonal
+            # positives are always injected for gathered in-batch pairs.
+            return logits.new_zeros(())
+
+        logits = logits[valid_rows]
+        positive_mask = positive_mask[valid_rows]
+        neg_inf = torch.finfo(logits.dtype).min
+        pos_logits = logits.masked_fill(~positive_mask, neg_inf)
+        pos_lse = torch.logsumexp(pos_logits, dim=1)
+        all_lse = torch.logsumexp(logits, dim=1)
+        return -(pos_lse - all_lse).mean()
+
     def _contrastive_loss(self, vision_feat, text_feat, scene_ids=None, text_ids=None, gather_ddp=False, use_queue=False):
         """Compute symmetric InfoNCE loss (image->text and text->image).
 
@@ -1142,14 +1173,35 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         if gather_ddp:
             global_vision = self._gather_with_grad(vision_feat)
             global_text = self._gather_with_grad(text_feat)
+            global_scene_ids = self._gather_no_grad(scene_ids) if scene_ids is not None else None
+            global_text_ids = self._gather_no_grad(text_ids) if text_ids is not None else None
         else:
             global_vision = vision_feat
             global_text = text_feat
+            global_scene_ids = scene_ids
+            global_text_ids = text_ids
+
+        local_scene_ids = None
+        if scene_ids is not None:
+            local_scene_ids = scene_ids.to(device=vision_feat.device, dtype=torch.long).view(-1)
+        if global_scene_ids is not None:
+            global_scene_ids = global_scene_ids.to(device=vision_feat.device, dtype=torch.long).view(-1)
+
+        local_text_ids = None
+        if text_ids is not None:
+            local_text_ids = text_ids.to(device=vision_feat.device, dtype=torch.long).view(-1)
+        if global_text_ids is not None:
+            global_text_ids = global_text_ids.to(device=vision_feat.device, dtype=torch.long).view(-1)
 
         # Learnable temperature in log space for numerical stability.
         scale = self.logit_scale.exp().clamp(max=100.0)
         logits_i2t = scale * (vision_feat @ global_text.t())
         logits_t2i = scale * (text_feat @ global_vision.t())
+
+        queue_scene_mask_i2t = None
+        queue_scene_mask_t2i = None
+        queue_text_mask_i2t = None
+        queue_text_mask_t2i = None
 
         if use_queue and self._queue_ready():
             qlen = int(self.queue_valid_len.item())
@@ -1158,33 +1210,40 @@ class BEVFormerDebertaAlign(BEVFormerV2):
 
             queue_logits_i2t = scale * (vision_feat @ queue_text.t())
             queue_logits_t2i = scale * (text_feat @ queue_vision.t())
-            if self.queue_use_scene_mask and scene_ids is not None:
-                local_scene_ids = scene_ids.to(device=vision_feat.device, dtype=torch.long).view(-1)
-                if local_scene_ids.shape[0] == vision_feat.shape[0]:
-                    text_queue_scene_ids = self.text_queue_scene_id[:qlen].detach().to(
-                        device=vision_feat.device, dtype=torch.long)
-                    vision_queue_scene_ids = self.vision_queue_scene_id[:qlen].detach().to(
-                        device=vision_feat.device, dtype=torch.long)
+            text_queue_scene_ids = self.text_queue_scene_id[:qlen].detach().to(
+                device=vision_feat.device, dtype=torch.long)
+            vision_queue_scene_ids = self.vision_queue_scene_id[:qlen].detach().to(
+                device=vision_feat.device, dtype=torch.long)
+            queue_scene_mask_i2t = self._pairwise_valid_equal_mask(local_scene_ids, text_queue_scene_ids)
+            queue_scene_mask_t2i = self._pairwise_valid_equal_mask(local_scene_ids, vision_queue_scene_ids)
 
-                    mask_i2t = local_scene_ids.unsqueeze(1).eq(text_queue_scene_ids.unsqueeze(0))
-                    mask_t2i = local_scene_ids.unsqueeze(1).eq(vision_queue_scene_ids.unsqueeze(0))
-                    queue_logits_i2t = queue_logits_i2t.masked_fill(mask_i2t, -1e4)
-                    queue_logits_t2i = queue_logits_t2i.masked_fill(mask_t2i, -1e4)
+            if (
+                not self.use_multi_positive
+                and self.queue_use_scene_mask
+                and queue_scene_mask_i2t is not None
+                and queue_scene_mask_t2i is not None
+                and local_scene_ids.shape[0] == vision_feat.shape[0]
+            ):
+                queue_logits_i2t = queue_logits_i2t.masked_fill(queue_scene_mask_i2t, -1e4)
+                queue_logits_t2i = queue_logits_t2i.masked_fill(queue_scene_mask_t2i, -1e4)
 
             # In trainval, different scenes can share identical descriptions.
             # Mask same-text queue entries to avoid false negatives.
-            if text_ids is not None:
-                local_text_ids = text_ids.to(device=vision_feat.device, dtype=torch.long).view(-1)
-                if local_text_ids.shape[0] == vision_feat.shape[0]:
-                    text_queue_text_ids = self.text_queue_text_id[:qlen].detach().to(
-                        device=vision_feat.device, dtype=torch.long)
-                    vision_queue_text_ids = self.vision_queue_text_id[:qlen].detach().to(
-                        device=vision_feat.device, dtype=torch.long)
+            text_queue_text_ids = self.text_queue_text_id[:qlen].detach().to(
+                device=vision_feat.device, dtype=torch.long)
+            vision_queue_text_ids = self.vision_queue_text_id[:qlen].detach().to(
+                device=vision_feat.device, dtype=torch.long)
+            queue_text_mask_i2t = self._pairwise_valid_equal_mask(local_text_ids, text_queue_text_ids)
+            queue_text_mask_t2i = self._pairwise_valid_equal_mask(local_text_ids, vision_queue_text_ids)
 
-                    text_mask_i2t = local_text_ids.unsqueeze(1).eq(text_queue_text_ids.unsqueeze(0))
-                    text_mask_t2i = local_text_ids.unsqueeze(1).eq(vision_queue_text_ids.unsqueeze(0))
-                    queue_logits_i2t = queue_logits_i2t.masked_fill(text_mask_i2t, -1e4)
-                    queue_logits_t2i = queue_logits_t2i.masked_fill(text_mask_t2i, -1e4)
+            if (
+                not self.use_multi_positive
+                and queue_text_mask_i2t is not None
+                and queue_text_mask_t2i is not None
+                and local_text_ids.shape[0] == vision_feat.shape[0]
+            ):
+                queue_logits_i2t = queue_logits_i2t.masked_fill(queue_text_mask_i2t, -1e4)
+                queue_logits_t2i = queue_logits_t2i.masked_fill(queue_text_mask_t2i, -1e4)
 
             logits_i2t = torch.cat([logits_i2t, queue_logits_i2t], dim=1)
             logits_t2i = torch.cat([logits_t2i, queue_logits_t2i], dim=1)
@@ -1196,13 +1255,50 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         else:
             labels = torch.arange(vision_feat.shape[0], device=vision_feat.device)
 
-        loss_i2t = F.cross_entropy(logits_i2t, labels)
-        loss_t2i = F.cross_entropy(logits_t2i, labels)
-        loss = 0.5 * (loss_i2t + loss_t2i)
+        if self.use_multi_positive:
+            # Build positive masks on global in-batch columns first.
+            global_cols = global_text.shape[0]
+            positive_mask_i2t = torch.zeros_like(logits_i2t, dtype=torch.bool)
+            positive_mask_t2i = torch.zeros_like(logits_t2i, dtype=torch.bool)
+            positive_mask_i2t.scatter_(1, labels.view(-1, 1), True)
+            positive_mask_t2i.scatter_(1, labels.view(-1, 1), True)
 
-        with torch.no_grad():
-            i2t_top1 = (logits_i2t.argmax(dim=1) == labels).float().mean()
-            t2i_top1 = (logits_t2i.argmax(dim=1) == labels).float().mean()
+            global_scene_mask = self._pairwise_valid_equal_mask(local_scene_ids, global_scene_ids)
+            if global_scene_mask is not None and global_scene_mask.shape[1] == global_cols:
+                positive_mask_i2t[:, :global_cols] |= global_scene_mask
+                positive_mask_t2i[:, :global_cols] |= global_scene_mask
+
+            global_text_mask = self._pairwise_valid_equal_mask(local_text_ids, global_text_ids)
+            if global_text_mask is not None and global_text_mask.shape[1] == global_cols:
+                positive_mask_i2t[:, :global_cols] |= global_text_mask
+                positive_mask_t2i[:, :global_cols] |= global_text_mask
+
+            if queue_scene_mask_i2t is not None:
+                positive_mask_i2t[:, global_cols:] |= queue_scene_mask_i2t
+            if queue_scene_mask_t2i is not None:
+                positive_mask_t2i[:, global_cols:] |= queue_scene_mask_t2i
+            if queue_text_mask_i2t is not None:
+                positive_mask_i2t[:, global_cols:] |= queue_text_mask_i2t
+            if queue_text_mask_t2i is not None:
+                positive_mask_t2i[:, global_cols:] |= queue_text_mask_t2i
+
+            loss_i2t = self._multi_positive_infonce(logits_i2t, positive_mask_i2t)
+            loss_t2i = self._multi_positive_infonce(logits_t2i, positive_mask_t2i)
+            loss = 0.5 * (loss_i2t + loss_t2i)
+
+            with torch.no_grad():
+                i2t_top1_idx = logits_i2t.argmax(dim=1, keepdim=True)
+                t2i_top1_idx = logits_t2i.argmax(dim=1, keepdim=True)
+                i2t_top1 = positive_mask_i2t.gather(1, i2t_top1_idx).float().mean()
+                t2i_top1 = positive_mask_t2i.gather(1, t2i_top1_idx).float().mean()
+        else:
+            loss_i2t = F.cross_entropy(logits_i2t, labels)
+            loss_t2i = F.cross_entropy(logits_t2i, labels)
+            loss = 0.5 * (loss_i2t + loss_t2i)
+
+            with torch.no_grad():
+                i2t_top1 = (logits_i2t.argmax(dim=1) == labels).float().mean()
+                t2i_top1 = (logits_t2i.argmax(dim=1) == labels).float().mean()
 
         return loss, i2t_top1, t2i_top1, logits_i2t
 

@@ -742,6 +742,30 @@ val 只在 rank0，避免多节点重复验证、重复写报表冲突。
 
 --------------------------------------------------------------------------------------------------------
 
+date: 202606241130
+
+训练损失现在支持“多正样本（同 scene 或同 text 都算正）”，用于减少伪负样本。
+
+新增开关（默认开启）
+参数定义: bevformerv2_debertav3_align.py:69
+文档说明: bevformerv2_debertav3_align.py:122
+成员赋值: bevformerv2_debertav3_align.py:179
+
+新增多正样本计算辅助函数
+有效 ID 相等掩码（忽略 -1）: bevformerv2_debertav3_align.py:1136
+Multi-positive InfoNCE: bevformerv2_debertav3_align.py:1146
+
+替换对比损失主逻辑
+在全局 batch 与 queue 上构建正样本掩码，并执行多正样本 loss: bevformerv2_debertav3_align.py:1258
+保留旧单正样本路径（可回退）: bevformerv2_debertav3_align.py:1294
+
+说明：
+现在同 scene 或同 text 的样本不会再被强行当负样本推开。
+你当前配置无需额外改动即可生效（默认已开启）。
+如果要对照实验，设 use_multi_positive=False 即可回到原逻辑。
+
+--------------------------------------------------------------------------------------------------------
+
 COMMAND:
 
 - offline_extract_bev:
