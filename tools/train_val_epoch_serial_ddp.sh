@@ -42,6 +42,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-3}"
 TORCHRUN_RDZV_TIMEOUT="${TORCHRUN_RDZV_TIMEOUT:-7200}"
 RDZV_ID="${RDZV_ID:-bevformer_align_ddp}"
 TORCHRUN_RDZV_CONF_EXTRA="${TORCHRUN_RDZV_CONF_EXTRA:-}"
+TORCHRUN_BACKEND_MODE="${TORCHRUN_BACKEND_MODE:-c10d}"
 
 # Network interface binding for stable multi-node rendezvous/NCCL.
 GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-}"
@@ -108,7 +109,11 @@ echo "[INFO] Work dir : ${WORK_DIR}"
 echo "[INFO] Epochs   : ${START_EPOCH} -> ${END_EPOCH}"
 echo "[INFO] DDP GPUs : ${CUDA_VISIBLE_DEVICES} (nproc=${NPROC_PER_NODE})"
 echo "[INFO] DDP nodes: nnodes=${NNODES}, node_rank=${NODE_RANK}"
-echo "[INFO] Rendezvous: ${MASTER_ADDR}:${MASTER_PORT} (rdzv_id=${RDZV_ID}, timeout=${TORCHRUN_RDZV_TIMEOUT}s)"
+if [[ "${TORCHRUN_BACKEND_MODE}" == "static" ]]; then
+  echo "[INFO] Torchrun mode: static (master=${MASTER_ADDR}:${MASTER_PORT})"
+else
+  echo "[INFO] Torchrun mode: c10d (rdzv=${MASTER_ADDR}:${MASTER_PORT}, rdzv_id=${RDZV_ID}, timeout=${TORCHRUN_RDZV_TIMEOUT}s)"
+fi
 echo "[INFO] Rsync sync: enable=${ENABLE_RSYNC_SYNC}, target=${RSYNC_TARGET_USER}@${RSYNC_TARGET_IP}::${RSYNC_TARGET_PATH}"
 echo "[INFO] Scene json: ${SCENE_JSON}"
 echo "[INFO] Train ann : ${TRAIN_ANN}"
@@ -285,16 +290,45 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
     --nnodes="${NNODES}"
     --node_rank="${NODE_RANK}"
     --nproc_per_node="${NPROC_PER_NODE}"
-    --rdzv_backend=c10d
-    --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}"
-    --rdzv_id="${RDZV_ID}"
-    --rdzv_conf "timeout=${TORCHRUN_RDZV_TIMEOUT},is_host=$([[ "${NODE_RANK}" -eq 0 ]] && echo true || echo false)${TORCHRUN_RDZV_CONF_EXTRA:+,${TORCHRUN_RDZV_CONF_EXTRA}}"
     tools/train.py
     "${CONFIG}"
     --launcher pytorch
     --work-dir "${WORK_DIR}"
     --no-validate
   )
+
+  if [[ "${TORCHRUN_BACKEND_MODE}" == "static" ]]; then
+    train_cmd=(
+      torchrun
+      --nnodes="${NNODES}"
+      --node_rank="${NODE_RANK}"
+      --nproc_per_node="${NPROC_PER_NODE}"
+      --rdzv_backend=static
+      --master_addr="${MASTER_ADDR}"
+      --master_port="${MASTER_PORT}"
+      tools/train.py
+      "${CONFIG}"
+      --launcher pytorch
+      --work-dir "${WORK_DIR}"
+      --no-validate
+    )
+  else
+    train_cmd=(
+      torchrun
+      --nnodes="${NNODES}"
+      --node_rank="${NODE_RANK}"
+      --nproc_per_node="${NPROC_PER_NODE}"
+      --rdzv_backend=c10d
+      --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}"
+      --rdzv_id="${RDZV_ID}"
+      --rdzv_conf "timeout=${TORCHRUN_RDZV_TIMEOUT},is_host=$([[ "${NODE_RANK}" -eq 0 ]] && echo true || echo false)${TORCHRUN_RDZV_CONF_EXTRA:+,${TORCHRUN_RDZV_CONF_EXTRA}}"
+      tools/train.py
+      "${CONFIG}"
+      --launcher pytorch
+      --work-dir "${WORK_DIR}"
+      --no-validate
+    )
+  fi
 
   if [[ "${epoch}" -gt 1 ]]; then
     resume_ckpt="${WORK_DIR}/epoch_${prev_epoch}.pth"

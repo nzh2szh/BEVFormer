@@ -30,6 +30,14 @@ from mmseg import __version__ as mmseg_version
 from mmcv.utils import TORCH_VERSION, digit_version
 
 
+def _boot_debug(msg):
+    if os.environ.get('DEBUG_TRAIN_BOOT', '0') == '1':
+        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+        rank = os.environ.get('RANK', '?')
+        local_rank = os.environ.get('LOCAL_RANK', '?')
+        print(f'[BOOT][{ts}][rank={rank}][local_rank={local_rank}] {msg}', flush=True)
+
+
 def _resolve_extract_mode(cfg):
     model_cfg = cfg.get('model', {})
     if not isinstance(model_cfg, dict):
@@ -167,14 +175,17 @@ def parse_args():
 
 def main():
     args = parse_args()
+    _boot_debug('parse_args done')
 
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+    _boot_debug('config loaded and merged')
     # import modules from string list.
     if cfg.get('custom_imports', None):
         from mmcv.utils import import_modules_from_strings
         import_modules_from_strings(**cfg['custom_imports'])
+    _boot_debug('custom imports done')
 
     # import modules from plguin/xx, registry will be updated
     if hasattr(cfg, 'plugin'):
@@ -201,6 +212,7 @@ def main():
                 plg_lib = importlib.import_module(_module_path)
 
             from projects.mmdet3d_plugin.bevformer.apis.train import custom_train_model
+    _boot_debug('plugin import done')
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):
         torch.backends.cudnn.benchmark = True
@@ -235,7 +247,9 @@ def main():
         distributed = False
     else:
         distributed = True
+        _boot_debug(f'init_dist start launcher={args.launcher}')
         init_dist(args.launcher, **cfg.dist_params)
+        _boot_debug('init_dist done')
         # re-set gpu_ids with distributed training mode
         _, world_size = get_dist_info()
         cfg.gpu_ids = range(world_size)
@@ -286,7 +300,9 @@ def main():
         cfg.model,
         train_cfg=cfg.get('train_cfg'),
         test_cfg=cfg.get('test_cfg'))
+    _boot_debug('build_model done')
     model.init_weights()
+    _boot_debug('model.init_weights done')
 
     logger.info(f'Model:\n{model}')
 

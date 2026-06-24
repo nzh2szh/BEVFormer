@@ -969,6 +969,7 @@ BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
 
 多PC，需要PC之间保持代码版本和路径、数据集路径、中间结果（work_dirs）一致：
 主节点：
+TORCHRUN_BACKEND_MODE=static \
 NNODES=2 \
 NODE_RANK=0 \
 MASTER_ADDR=192.168.103.2 \
@@ -977,18 +978,21 @@ NPROC_PER_NODE=3 \
 CUDA_VISIBLE_DEVICES=0,1,2 \
 GLOO_SOCKET_IFNAME=eno2 \
 NCCL_SOCKET_IFNAME=eno2 \
+NCCL_IB_DISABLE=1 \
+NCCL_NET=Socket \
 ENABLE_RSYNC_SYNC=true \
 RSYNC_PASSWORD_FILE=/etc/rsync.password \
 RSYNC_TARGET_IP=192.168.103.3 \
 RSYNC_TARGET_USER=rsync_user \
 RSYNC_TARGET_PATH=backup_module/ \
 START_EPOCH=1 \
-END_EPOCH=2 \
+END_EPOCH=1 \
 DATASET_PROFILE=trainval \
 BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
 ./tools/train_val_epoch_serial_ddp.sh
 
 从节点:
+TORCHRUN_BACKEND_MODE=static \
 NNODES=2 \
 NODE_RANK=1 \
 MASTER_ADDR=192.168.103.2 \
@@ -997,9 +1001,11 @@ NPROC_PER_NODE=3 \
 CUDA_VISIBLE_DEVICES=0,1,2 \
 GLOO_SOCKET_IFNAME=eno2 \
 NCCL_SOCKET_IFNAME=eno2 \
+NCCL_IB_DISABLE=1 \
+NCCL_NET=Socket \
 ENABLE_RSYNC_SYNC=true \
 START_EPOCH=1 \
-END_EPOCH=2 \
+END_EPOCH=1 \
 DATASET_PROFILE=trainval \
 BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
 ./tools/train_val_epoch_serial_ddp.sh
@@ -1079,6 +1085,19 @@ train_avg_loss_align
 val_loss_align
 看验证集是否同步下降。
 如果 train 降、val 不降甚至升，才是典型过拟合信号。
+
+多机主从防护墙：
+主机 192.168.103.2：
+sudo ufw allow in proto tcp from 192.168.103.3 to any port 1024:65535
+sudo ufw allow out proto tcp to 192.168.103.3 port 1024:65535
+sudo ufw reload
+sudo ufw status verbose
+
+从机 192.168.103.3：
+sudo ufw allow in proto tcp from 192.168.103.2 to any port 1024:65535
+sudo ufw allow out proto tcp to 192.168.103.2 port 1024:65535
+sudo ufw reload
+sudo ufw status verbose
 
 
 
