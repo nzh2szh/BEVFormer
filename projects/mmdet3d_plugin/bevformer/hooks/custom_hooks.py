@@ -87,6 +87,7 @@ class DebugTrainableUpdateHook(Hook):
         self.log_detail = bool(log_detail)
         self.log_summary = bool(log_summary)
         self._tracked = []
+        self._summary_tracked = []
         self._init_params = {}
 
     def _get_model(self, runner):
@@ -127,21 +128,24 @@ class DebugTrainableUpdateHook(Hook):
     def before_run(self, runner):
         model = self._get_model(runner)
         tracked = []
+        summary_tracked = []
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
             if not self._match(name):
                 continue
-            tracked.append((name, param))
+            summary_tracked.append((name, param))
             self._init_params[name] = param.detach().float().cpu().clone()
-            if len(tracked) >= self.max_params:
-                break
+            if len(tracked) < self.max_params:
+                tracked.append((name, param))
         self._tracked = tracked
+        self._summary_tracked = summary_tracked
 
         names = [n for n, _ in tracked]
         runner.logger.info(
-            'DebugTrainableUpdateHook: tracking {} params, interval={}, detail={}, summary={}, keywords={}. names={}'.format(
+            'DebugTrainableUpdateHook: detail_tracking={} summary_tracking={} interval={}, detail={}, summary={}, keywords={}. names={}'.format(
                 len(names),
+                len(summary_tracked),
                 self.interval,
                 self.log_detail,
                 self.log_summary,
@@ -162,11 +166,20 @@ class DebugTrainableUpdateHook(Hook):
 
         all_grad = []
         all_delta = []
+        all_param_abs = []
         group_grad = {}
         group_delta = {}
+        group_param_abs = {}
+        group_param_count = {}
 
-        for name, param in self._tracked:
+        for name, param in self._summary_tracked:
             group = self._group_name(name)
+            group_param_count[group] = group_param_count.get(group, 0) + 1
+
+            param_abs_mean = float(param.detach().float().abs().mean().item())
+            all_param_abs.append(param_abs_mean)
+            group_param_abs.setdefault(group, []).append(param_abs_mean)
+
             grad_norm = None
             if param.grad is not None:
                 grad_norm = float(param.grad.detach().float().norm().item())
@@ -181,6 +194,17 @@ class DebugTrainableUpdateHook(Hook):
                 all_delta.append(delta_mean_abs)
                 group_delta.setdefault(group, []).append(delta_mean_abs)
 
+        for name, param in self._tracked:
+            grad_norm = None
+            if param.grad is not None:
+                grad_norm = float(param.grad.detach().float().norm().item())
+
+            init = self._init_params.get(name, None)
+            delta_mean_abs = None
+            if init is not None:
+                cur = param.detach().float().cpu()
+                delta_mean_abs = float((cur - init).abs().mean().item())
+
             if self.log_detail:
                 runner.logger.info(
                     '[DebugUpdate] {} grad_norm={} delta_mean_abs={}'.format(
@@ -193,27 +217,38 @@ class DebugTrainableUpdateHook(Hook):
         if self.log_summary:
             mean_grad = 0.0 if len(all_grad) == 0 else sum(all_grad) / float(len(all_grad))
             mean_delta = 0.0 if len(all_delta) == 0 else sum(all_delta) / float(len(all_delta))
+            mean_param_abs = 0.0 if len(all_param_abs) == 0 else sum(all_param_abs) / float(len(all_param_abs))
+            update_ratio = 0.0 if mean_param_abs <= 0.0 else mean_delta / mean_param_abs
             runner.logger.info(
-                '[DebugUpdateSummary] tracked={} grad_count={} mean_grad={} delta_count={} mean_delta={}'.format(
-                    len(self._tracked),
+                '[DebugUpdateSummary] tracked={} grad_count={} mean_grad={} delta_count={} mean_delta={} param_count={} mean_param_abs={} update_ratio={}'.format(
+                    len(self._summary_tracked),
                     len(all_grad),
                     '{:.6e}'.format(mean_grad),
                     len(all_delta),
                     '{:.6e}'.format(mean_delta),
+                    len(all_param_abs),
+                    '{:.6e}'.format(mean_param_abs),
+                    '{:.6e}'.format(update_ratio),
                 )
             )
 
             for k in self.param_keywords:
                 gvals = group_grad.get(k, [])
                 dvals = group_delta.get(k, [])
+                pvals = group_param_abs.get(k, [])
                 gmean = 0.0 if len(gvals) == 0 else sum(gvals) / float(len(gvals))
                 dmean = 0.0 if len(dvals) == 0 else sum(dvals) / float(len(dvals))
+                pmean = 0.0 if len(pvals) == 0 else sum(pvals) / float(len(pvals))
+                uratio = 0.0 if pmean <= 0.0 else dmean / pmean
                 runner.logger.info(
-                    '[DebugUpdateSummary] group={} grad_count={} mean_grad={} delta_count={} mean_delta={}'.format(
+                    '[DebugUpdateSummary] group={} param_count={} grad_count={} mean_grad={} delta_count={} mean_delta={} mean_param_abs={} update_ratio={}'.format(
                         k,
+                        group_param_count.get(k, 0),
                         len(gvals),
                         '{:.6e}'.format(gmean),
                         len(dvals),
                         '{:.6e}'.format(dmean),
+                        '{:.6e}'.format(pmean),
+                        '{:.6e}'.format(uratio),
                     )
                 )

@@ -44,9 +44,9 @@ model = dict(
     spatial_bev_h=200,
     spatial_bev_w=200,
     gather_ddp=True,
-    use_feature_queue=False,
+    use_feature_queue=True,
     feature_queue_size=32,
-    feature_queue_warmup_steps=50,
+    feature_queue_warmup_steps=150,
     queue_use_scene_mask=True,
     # Enable BF16 runtime for frozen backbones and alignment head.
     use_bf16_amp=True,
@@ -121,7 +121,7 @@ custom_hooks = [
     ),
     dict(
         type='DebugTrainableUpdateHook',
-        interval=200,
+        interval=150,
         param_keywords=['vision_projector', 'text_projector', 'logit_scale', 'temporal_encoder'],
         max_params=20,
         log_detail=False,
