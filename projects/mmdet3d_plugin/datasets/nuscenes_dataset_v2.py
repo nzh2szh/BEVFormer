@@ -39,6 +39,7 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
 
         if self.offline_meta_only and self.offline_unique_anchor:
             self._offline_chunks = self._build_offline_chunks()
+            self._sync_flag_with_offline_chunks()
         if not self.test_mode and mono_cfg is not None:
             self.mono_dataset = DD3DNuscenesDataset(**mono_cfg)
 
@@ -71,6 +72,22 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
                     continue
                 chunks.append((scene_token, chunk))
         return chunks
+
+    def _sync_flag_with_offline_chunks(self):
+        """Shrink sampler flags to chunk-level when unique-anchor is enabled."""
+        if self._offline_chunks is None:
+            return
+
+        flag = getattr(self, 'flag', None)
+        if flag is None:
+            self.flag = np.zeros(len(self._offline_chunks), dtype=np.uint8)
+            return
+
+        chunk_flags = []
+        for _, chunk_indices in self._offline_chunks:
+            anchor_idx = chunk_indices[-1]
+            chunk_flags.append(flag[anchor_idx])
+        self.flag = np.asarray(chunk_flags, dtype=flag.dtype)
 
     def __len__(self):
         if (getattr(self, 'offline_meta_only', False)
