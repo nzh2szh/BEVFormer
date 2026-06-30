@@ -1126,5 +1126,61 @@ sudo ufw reload
 sudo ufw status verbose
 
 
+多PC，需要PC之间保持代码版本和路径、数据集路径、中间结果（work_dirs）一致：
+主节点：
+TORCHRUN_BACKEND_MODE=static \
+NNODES=2 \
+NODE_RANK=0 \
+MASTER_ADDR=192.168.103.2 \
+MASTER_PORT=29501 \
+NPROC_PER_NODE=3 \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+GLOO_SOCKET_IFNAME=eno2 \
+NCCL_SOCKET_IFNAME=eno2 \
+NCCL_IB_DISABLE=1 \
+NCCL_NET=Socket \
+ENABLE_RSYNC_SYNC=true \
+RSYNC_PASSWORD_FILE=/etc/rsync.password \
+RSYNC_TARGET_IP=192.168.103.3 \
+RSYNC_TARGET_USER=rsync_user \
+RSYNC_TARGET_PATH=backup_module/ \
+DATASET_PROFILE=trainval \
+WORK_DIR=work_dirs/trainval_ddp_offline_train_val \
+START_EPOCH=1 \
+END_EPOCH=30 \
+SERIAL_TOTAL_EPOCHS=100 \
+OFFLINE_UNIQUE_ANCHOR=true \
+SCENE_JSON=data/nuscenes/v1.0-trainval/scene.json \
+TRAIN_ANN=data/nuscenes/nuscenes_infos_temporal_train.pkl \
+VAL_ANN=data/nuscenes/nuscenes_infos_temporal_val.pkl \
+BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
+./tools/train_val_epoch_serial_ddp.sh
+
+从节点：
+TORCHRUN_BACKEND_MODE=static \
+NNODES=2 \
+NODE_RANK=1 \
+MASTER_ADDR=192.168.103.2 \
+MASTER_PORT=29501 \
+NPROC_PER_NODE=3 \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+GLOO_SOCKET_IFNAME=eno2 \
+NCCL_SOCKET_IFNAME=eno2 \
+NCCL_IB_DISABLE=1 \
+NCCL_NET=Socket \
+ENABLE_RSYNC_SYNC=true \
+DATASET_PROFILE=trainval \
+WORK_DIR=work_dirs/trainval_ddp_offline_train_val \
+START_EPOCH=1 \
+END_EPOCH=30 \
+SERIAL_TOTAL_EPOCHS=100 \
+OFFLINE_UNIQUE_ANCHOR=true \
+SCENE_JSON=data/nuscenes/v1.0-trainval/scene.json \
+TRAIN_ANN=data/nuscenes/nuscenes_infos_temporal_train.pkl \
+VAL_ANN=data/nuscenes/nuscenes_infos_temporal_val.pkl \
+BASE_CKPT=./ckpts/bevformer/epoch_24.pth \
+./tools/train_val_epoch_serial_ddp.sh
+
+
 
 

@@ -31,6 +31,9 @@ WORK_DIR="${WORK_DIR:-${DEFAULT_WORK_DIR}}"
 # Epoch range: inclusive.
 START_EPOCH="${START_EPOCH:-1}"
 END_EPOCH="${END_EPOCH:-1}"
+# Keep one consistent training horizon across the whole serial run so resume
+# continues the same LR schedule instead of restarting a shorter schedule each epoch.
+SERIAL_TOTAL_EPOCHS="${SERIAL_TOTAL_EPOCHS:-${END_EPOCH}}"
 
 # DDP settings.
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"
@@ -108,6 +111,7 @@ echo "[INFO] Repo root: ${REPO_ROOT}"
 echo "[INFO] Dataset  : ${DATASET_PROFILE}"
 echo "[INFO] Work dir : ${WORK_DIR}"
 echo "[INFO] Epochs   : ${START_EPOCH} -> ${END_EPOCH}"
+echo "[INFO] Train horizon: ${SERIAL_TOTAL_EPOCHS}"
 echo "[INFO] DDP GPUs : ${CUDA_VISIBLE_DEVICES} (nproc=${NPROC_PER_NODE})"
 echo "[INFO] DDP nodes: nnodes=${NNODES}, node_rank=${NODE_RANK}"
 if [[ "${TORCHRUN_BACKEND_MODE}" == "static" ]]; then
@@ -131,6 +135,11 @@ fi
 
 if [[ "${START_EPOCH}" -gt "${END_EPOCH}" ]]; then
   echo "[ERROR] START_EPOCH (${START_EPOCH}) must be <= END_EPOCH (${END_EPOCH})"
+  exit 1
+fi
+
+if [[ "${SERIAL_TOTAL_EPOCHS}" -lt "${END_EPOCH}" ]]; then
+  echo "[ERROR] SERIAL_TOTAL_EPOCHS (${SERIAL_TOTAL_EPOCHS}) must be >= END_EPOCH (${END_EPOCH})"
   exit 1
 fi
 
@@ -249,6 +258,7 @@ prepare_and_validate_epoch_range_marker() {
     cat > "${marker}" <<EOF
 START_EPOCH=${START_EPOCH}
 END_EPOCH=${END_EPOCH}
+SERIAL_TOTAL_EPOCHS=${SERIAL_TOTAL_EPOCHS}
 DATASET_PROFILE=${DATASET_PROFILE}
 RDZV_ID=${RDZV_ID}
 EOF
@@ -268,13 +278,14 @@ EOF
 
   marker_start="$(grep -E '^START_EPOCH=' "${marker}" | head -1 | cut -d'=' -f2-)"
   marker_end="$(grep -E '^END_EPOCH=' "${marker}" | head -1 | cut -d'=' -f2-)"
+  marker_total="$(grep -E '^SERIAL_TOTAL_EPOCHS=' "${marker}" | head -1 | cut -d'=' -f2-)"
   marker_profile="$(grep -E '^DATASET_PROFILE=' "${marker}" | head -1 | cut -d'=' -f2-)"
   marker_rdzv_id="$(grep -E '^RDZV_ID=' "${marker}" | head -1 | cut -d'=' -f2-)"
 
-  if [[ "${marker_start}" != "${START_EPOCH}" || "${marker_end}" != "${END_EPOCH}" || "${marker_profile}" != "${DATASET_PROFILE}" || "${marker_rdzv_id}" != "${RDZV_ID}" ]]; then
+  if [[ "${marker_start}" != "${START_EPOCH}" || "${marker_end}" != "${END_EPOCH}" || "${marker_total}" != "${SERIAL_TOTAL_EPOCHS}" || "${marker_profile}" != "${DATASET_PROFILE}" || "${marker_rdzv_id}" != "${RDZV_ID}" ]]; then
     echo "[ERROR] Cross-node startup mismatch detected on node_rank=${NODE_RANK}."
-    echo "[ERROR] Local : START_EPOCH=${START_EPOCH}, END_EPOCH=${END_EPOCH}, DATASET_PROFILE=${DATASET_PROFILE}, RDZV_ID=${RDZV_ID}"
-    echo "[ERROR] Marker: START_EPOCH=${marker_start}, END_EPOCH=${marker_end}, DATASET_PROFILE=${marker_profile}, RDZV_ID=${marker_rdzv_id}"
+    echo "[ERROR] Local : START_EPOCH=${START_EPOCH}, END_EPOCH=${END_EPOCH}, SERIAL_TOTAL_EPOCHS=${SERIAL_TOTAL_EPOCHS}, DATASET_PROFILE=${DATASET_PROFILE}, RDZV_ID=${RDZV_ID}"
+    echo "[ERROR] Marker: START_EPOCH=${marker_start}, END_EPOCH=${marker_end}, SERIAL_TOTAL_EPOCHS=${marker_total}, DATASET_PROFILE=${marker_profile}, RDZV_ID=${marker_rdzv_id}"
     exit 1
   fi
 }
@@ -358,8 +369,8 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
     data.workers_per_gpu="${TRAIN_WORKERS_PER_GPU}"
     data.persistent_workers=False
     data.prefetch_factor=1
-    total_epochs="${epoch}"
-    runner.max_epochs="${epoch}"
+    total_epochs="${SERIAL_TOTAL_EPOCHS}"
+    runner.max_epochs="${SERIAL_TOTAL_EPOCHS}"
   )
 
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \

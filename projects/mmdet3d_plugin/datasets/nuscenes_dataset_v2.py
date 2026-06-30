@@ -54,7 +54,7 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
             eval_cfg.class_names = list(class_names)
 
     def _build_offline_chunks(self):
-        """Build non-overlap chunks so each frame is used once per epoch."""
+        """Build one offline chunk per scene using the earliest frames."""
         if self.queue_length <= 0:
             raise ValueError('frames must be non-empty when offline_unique_anchor=True')
 
@@ -66,11 +66,10 @@ class CustomNuScenesDatasetV2(NuScenesDataset):
         for scene_token, items in by_scene.items():
             items.sort(key=lambda x: x[0])
             ordered_indices = [idx for _, idx in items]
-            for start in range(0, len(ordered_indices), self.queue_length):
-                chunk = ordered_indices[start:start + self.queue_length]
-                if len(chunk) < self.queue_length and self.offline_drop_last_chunk:
-                    continue
-                chunks.append((scene_token, chunk))
+            chunk = ordered_indices[:self.queue_length]
+            if len(chunk) < self.queue_length and self.offline_drop_last_chunk:
+                continue
+            chunks.append((scene_token, chunk))
         return chunks
 
     def _sync_flag_with_offline_chunks(self):
