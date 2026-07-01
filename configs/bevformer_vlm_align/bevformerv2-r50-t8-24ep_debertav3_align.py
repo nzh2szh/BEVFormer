@@ -46,9 +46,10 @@ model = dict(
     spatial_bev_h=200,
     spatial_bev_w=200,
     gather_ddp=True,
-    use_feature_queue=False,
+    use_feature_queue=True,
+    use_multi_positive=True,
     feature_queue_size=32,
-    feature_queue_warmup_steps=150,
+    feature_queue_warmup_steps=1000,
     queue_use_scene_mask=True,
     # Enable BF16 runtime for frozen backbones and alignment head.
     use_bf16_amp=True,
