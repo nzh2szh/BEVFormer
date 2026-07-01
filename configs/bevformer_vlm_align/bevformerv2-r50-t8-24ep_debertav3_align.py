@@ -19,6 +19,8 @@ model = dict(
     text_model_local_files_only=False,
     # Keep Hugging Face cache inside project ckpts directory.
     text_model_cache_dir='ckpts/hf_cache',
+    # Bound long scene descriptions before DeBERTa encoding.
+    text_max_length=512,
     scene_json='data/nuscenes/v1.0-trainval/scene.json',
     scene_text_field='description',
     # compat mode: origin|offline_extract_bev|offline_train|offline_infer|offline_infer_validate

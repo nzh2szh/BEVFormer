@@ -48,6 +48,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                  text_model_revision=None,
                  text_model_local_files_only=False,
                  text_model_cache_dir=None,
+                 text_max_length=512,
                  scene_json='data/nuscenes/v1.0-trainval/scene.json',
                  scene_text_field='description',
                  expected_frames=40,
@@ -87,6 +88,8 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 files from local cache/path and never access network.
             text_model_cache_dir (str | None): Optional cache directory passed
                 to Hugging Face `from_pretrained`.
+            text_max_length (int): Maximum token length for scene text
+                encoding. Longer descriptions are truncated before DeBERTa.
             scene_json (str): Path to scene metadata file used to map
                 scene_token -> text description.
             scene_text_field (str): Field name in scene.json used as text
@@ -167,6 +170,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
 
         self.expected_frames = expected_frames
         self.max_frames = max(max_frames, expected_frames)
+        self.text_max_length = int(text_max_length)
         self.scene_json = scene_json
         self.scene_text_field = scene_text_field
         self.spatial_bev_h = spatial_bev_h
@@ -947,6 +951,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
             texts,
             padding=True,
             truncation=True,
+            max_length=self.text_max_length,
             return_tensors='pt')
         batch_tokens = {k: v.to(device) for k, v in batch_tokens.items()}
 

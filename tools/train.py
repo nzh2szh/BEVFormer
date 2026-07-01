@@ -104,6 +104,17 @@ def _set_dataset_flag(dataset_cfg, key, value):
         _set_dataset_flag(dataset_cfg['datasets'], key, value)
 
 
+def _sanitize_lr_config(cfg):
+    """Normalize lr_config overrides that MMCV hooks do not accept together."""
+    lr_cfg = cfg.get('lr_config', None)
+    if not isinstance(lr_cfg, dict):
+        return
+
+    if lr_cfg.get('policy', None) == 'Fixed':
+        lr_cfg.pop('min_lr_ratio', None)
+        lr_cfg.pop('min_lr', None)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('config', help='train config file path')
@@ -180,6 +191,7 @@ def main():
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+    _sanitize_lr_config(cfg)
     _boot_debug('config loaded and merged')
     # import modules from string list.
     if cfg.get('custom_imports', None):

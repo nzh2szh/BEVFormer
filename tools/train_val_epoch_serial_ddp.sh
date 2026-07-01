@@ -31,8 +31,9 @@ WORK_DIR="${WORK_DIR:-${DEFAULT_WORK_DIR}}"
 # Epoch range: inclusive.
 START_EPOCH="${START_EPOCH:-1}"
 END_EPOCH="${END_EPOCH:-1}"
-# Keep one consistent training horizon across the whole serial run so resume
-# continues the same LR schedule instead of restarting a shorter schedule each epoch.
+# Planned final epoch for this serial run. Note: the per-epoch loop still
+# advances training by setting runner.max_epochs to the current epoch, so the
+# train command returns after exactly one new epoch.
 SERIAL_TOTAL_EPOCHS="${SERIAL_TOTAL_EPOCHS:-${END_EPOCH}}"
 
 # DDP settings.
@@ -75,6 +76,8 @@ TRAIN_WORKERS_PER_GPU="${TRAIN_WORKERS_PER_GPU:-2}"
 VAL_SAMPLES_PER_GPU="${VAL_SAMPLES_PER_GPU:-1}"
 VAL_WORKERS_PER_GPU="${VAL_WORKERS_PER_GPU:-2}"
 OFFLINE_UNIQUE_ANCHOR="${OFFLINE_UNIQUE_ANCHOR:-false}"
+SERIAL_LR_POLICY="${SERIAL_LR_POLICY:-config}"
+SERIAL_FIXED_LR="${SERIAL_FIXED_LR:-}"
 VAL_LOG_SUBDIR="${VAL_LOG_SUBDIR:-val_logs}"
 VAL_LOAD_REPORT_SUBDIR="${VAL_LOAD_REPORT_SUBDIR:-align_val_load_reports}"
 VAL_SUMMARY_FILE="${VAL_SUMMARY_FILE:-val_metrics.tsv}"
@@ -124,6 +127,10 @@ echo "[INFO] Scene json: ${SCENE_JSON}"
 echo "[INFO] Train ann : ${TRAIN_ANN}"
 echo "[INFO] Val ann   : ${VAL_ANN}"
 echo "[INFO] Unique anchor: ${OFFLINE_UNIQUE_ANCHOR}"
+echo "[INFO] Serial LR policy: ${SERIAL_LR_POLICY}"
+if [[ -n "${SERIAL_FIXED_LR}" ]]; then
+  echo "[INFO] Serial fixed LR override: ${SERIAL_FIXED_LR}"
+fi
 echo "[INFO] Val logs  : ${WORK_DIR}/${VAL_LOG_SUBDIR}"
 echo "[INFO] Val summary: ${summary_path}"
 echo "[INFO] Val metrics json: ${WORK_DIR}/${VAL_METRICS_SUBDIR}"
@@ -140,6 +147,11 @@ fi
 
 if [[ "${SERIAL_TOTAL_EPOCHS}" -lt "${END_EPOCH}" ]]; then
   echo "[ERROR] SERIAL_TOTAL_EPOCHS (${SERIAL_TOTAL_EPOCHS}) must be >= END_EPOCH (${END_EPOCH})"
+  exit 1
+fi
+
+if [[ "${SERIAL_LR_POLICY}" != "config" && "${SERIAL_LR_POLICY}" != "Fixed" ]]; then
+  echo "[ERROR] SERIAL_LR_POLICY must be config or Fixed, got: ${SERIAL_LR_POLICY}"
   exit 1
 fi
 
@@ -369,9 +381,16 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
     data.workers_per_gpu="${TRAIN_WORKERS_PER_GPU}"
     data.persistent_workers=False
     data.prefetch_factor=1
-    total_epochs="${SERIAL_TOTAL_EPOCHS}"
-    runner.max_epochs="${SERIAL_TOTAL_EPOCHS}"
+    total_epochs="${epoch}"
+    runner.max_epochs="${epoch}"
   )
+
+  if [[ "${SERIAL_LR_POLICY}" == "Fixed" ]]; then
+    train_cmd+=(lr_config.policy=Fixed)
+    if [[ -n "${SERIAL_FIXED_LR}" ]]; then
+      train_cmd+=(optimizer.lr="${SERIAL_FIXED_LR}")
+    fi
+  fi
 
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
   PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}" \
