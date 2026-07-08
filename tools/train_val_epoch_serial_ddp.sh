@@ -595,6 +595,7 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
     model.offline_split=val
     model.scene_json="${SCENE_JSON}"
     data.val.offline_unique_anchor="${OFFLINE_UNIQUE_ANCHOR}"
+    data.val.offline_meta_only=True
   )
   if [[ -n "${VAL_ANN}" ]]; then
     val_cfg_opts+=(data.val.ann_file="${VAL_ANN}")

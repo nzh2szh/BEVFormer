@@ -1629,6 +1629,14 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         computed within current inference batch.
         """
         offline_mode = self.run_mode in {'offline_infer', 'offline_infer_validate'}
+        if isinstance(img, (list, tuple)):
+            if len(img) != 1:
+                raise NotImplementedError('Augmented test-time inference is not supported for BEVFormerDebertaAlign.')
+            img = img[0]
+        if isinstance(img_metas, (list, tuple)) and img_metas and isinstance(img_metas[0], (list, tuple)):
+            if len(img_metas) != 1:
+                raise NotImplementedError('Augmented test-time inference is not supported for BEVFormerDebertaAlign.')
+            img_metas = img_metas[0]
         if img is None and not offline_mode:
             raise ValueError('img is required for BEVFormerDebertaAlign in non-offline mode.')
 

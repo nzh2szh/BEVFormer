@@ -194,6 +194,7 @@ def build_validate_cfg_overrides(args, cfg, diagnostics_ann_file=None, force_off
         overrides.extend([
             'model.run_mode=offline_infer_validate',
             'model.offline_split=val',
+            'data.val.offline_meta_only=True',
         ])
         if force_offline_meta_only:
             overrides.append('data.val.offline_meta_only=True')
