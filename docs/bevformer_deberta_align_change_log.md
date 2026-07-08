@@ -1,3 +1,53 @@
+date: 202607081820
+
+改动内容：
+
+正式 val 与 diagnostics 彻底拆开。
+位置：
+tools/train_val_epoch_serial_ddp.sh
+tools/train_validate_vlm_align.py
+
+现在的 serial 脚本行为：
+
+正式 val 永远跑完整 val_ann，不再因为 embedding diagnostics 打开而把 data.val.ann_file 切到 one-per-scene subset。
+embedding diagnostics 改为第二次独立调用 validate_vlm_align.py。
+diagnostics 可以单独使用 one-per-scene clip subset。
+新增 EMBEDDING_DIAGNOSTICS_INTERVAL，控制每隔多少个 epoch 跑一次 diagnostics，默认 1。
+新增独立目录：
+embedding_diagnostics_logs
+embedding_diagnostics_load_reports
+新增独立 summary 文件：
+embedding_diagnostics.tsv
+
+现在 diagnostics summary 会单独记录：
+epoch
+align_ckpt
+diagnostics_ann
+val_loss_align
+i2t_top1
+t2i_top1
+i2t_r5
+i2t_r10
+t2i_r5
+t2i_r10
+embedding_diagnostics
+diagnostics_log
+diagnostics_load_report
+
+现在的单机 train_validate_vlm_align.py 行为：
+
+正式 retrieval validation 始终走完整 val 配置。
+只有在命中 embedding_diagnostics_interval 时，才额外跑一次 diagnostics 导出。
+新增参数：
+--embedding-diagnostics-interval
+
+这次修复解决的问题：
+
+之前一旦打开 diagnostics，正式 val 的 ann_file 也会被 subset 覆盖，导致“正式指标”和“diagnostics 口径”混在一起。
+现在正式指标和 diagnostics 口径完全分离，且 diagnostics 频率可控。
+
+--------------------------------------------------------------------------------------------------------
+
 date: 202606111600
 
 改动：
@@ -1146,14 +1196,14 @@ RSYNC_TARGET_USER=rsync_user \
 RSYNC_TARGET_PATH=backup_module/ \
 DATASET_PROFILE=trainval \
 WORK_DIR=work_dirs/trainval_ddp_offline_train_val \
-START_EPOCH=86 \
-END_EPOCH=90 \
-SERIAL_TOTAL_EPOCHS=120 \
-SERIAL_LR_POLICY=Fixed \
-SERIAL_FIXED_LR=1e-5 \
+START_EPOCH=1 \
+END_EPOCH=5 \
+SERIAL_TOTAL_EPOCHS=100 \
+SERIAL_LR_POLICY=config \
 OFFLINE_UNIQUE_ANCHOR=true \
 EMBEDDING_DIAGNOSTICS_ENABLE=true \
 DIAGNOSTICS_SUBSET_ONE_PER_SCENE=true \
+EMBEDDING_DIAGNOSTICS_INTERVAL=5 \
 SCENE_JSON=data/nuscenes/v1.0-trainval/scene.json \
 TRAIN_ANN=data/nuscenes/nuscenes_infos_temporal_train.pkl \
 VAL_ANN=data/nuscenes/nuscenes_infos_temporal_val.pkl \
@@ -1175,14 +1225,14 @@ NCCL_NET=Socket \
 ENABLE_RSYNC_SYNC=true \
 DATASET_PROFILE=trainval \
 WORK_DIR=work_dirs/trainval_ddp_offline_train_val \
-START_EPOCH=86 \
-END_EPOCH=90 \
-SERIAL_TOTAL_EPOCHS=120 \
-SERIAL_LR_POLICY=Fixed \
-SERIAL_FIXED_LR=1e-5 \
+START_EPOCH=1 \
+END_EPOCH=5 \
+SERIAL_TOTAL_EPOCHS=100 \
+SERIAL_LR_POLICY=config \
 OFFLINE_UNIQUE_ANCHOR=true \
 EMBEDDING_DIAGNOSTICS_ENABLE=true \
 DIAGNOSTICS_SUBSET_ONE_PER_SCENE=true \
+EMBEDDING_DIAGNOSTICS_INTERVAL=5 \
 SCENE_JSON=data/nuscenes/v1.0-trainval/scene.json \
 TRAIN_ANN=data/nuscenes/nuscenes_infos_temporal_train.pkl \
 VAL_ANN=data/nuscenes/nuscenes_infos_temporal_val.pkl \

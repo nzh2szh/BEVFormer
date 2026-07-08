@@ -83,10 +83,15 @@ VAL_LOAD_REPORT_SUBDIR="${VAL_LOAD_REPORT_SUBDIR:-align_val_load_reports}"
 VAL_SUMMARY_FILE="${VAL_SUMMARY_FILE:-val_metrics.tsv}"
 VAL_METRICS_SUBDIR="${VAL_METRICS_SUBDIR:-val_metrics_json}"
 EMBEDDING_DIAGNOSTICS_ENABLE="${EMBEDDING_DIAGNOSTICS_ENABLE:-false}"
+EMBEDDING_DIAGNOSTICS_INTERVAL="${EMBEDDING_DIAGNOSTICS_INTERVAL:-1}"
 EMBEDDING_DIAGNOSTICS_SUBDIR="${EMBEDDING_DIAGNOSTICS_SUBDIR:-embedding_diagnostics}"
 EMBEDDING_DIAGNOSTICS_NAME_TEMPLATE="${EMBEDDING_DIAGNOSTICS_NAME_TEMPLATE:-embedding_diag_epoch_%s.json}"
+EMBEDDING_DIAGNOSTICS_LOG_SUBDIR="${EMBEDDING_DIAGNOSTICS_LOG_SUBDIR:-embedding_diagnostics_logs}"
+EMBEDDING_DIAGNOSTICS_LOAD_REPORT_SUBDIR="${EMBEDDING_DIAGNOSTICS_LOAD_REPORT_SUBDIR:-embedding_diagnostics_load_reports}"
+EMBEDDING_DIAGNOSTICS_SUMMARY_FILE="${EMBEDDING_DIAGNOSTICS_SUMMARY_FILE:-embedding_diagnostics.tsv}"
 DIAGNOSTICS_SUBSET_ONE_PER_SCENE="${DIAGNOSTICS_SUBSET_ONE_PER_SCENE:-false}"
 DIAGNOSTICS_SUBSET_PATH="${DIAGNOSTICS_SUBSET_PATH:-${WORK_DIR}/tmp_val_one_per_scene.pkl}"
+DIAGNOSTICS_SUBSET_CLIP_LENGTH="${DIAGNOSTICS_SUBSET_CLIP_LENGTH:-40}"
 DIAGNOSTICS_ANN="${DIAGNOSTICS_ANN:-}"
 DIAGNOSTICS_OFFLINE_META_ONLY="${DIAGNOSTICS_OFFLINE_META_ONLY:-true}"
 
@@ -115,11 +120,18 @@ mkdir -p "${WORK_DIR}/${VAL_LOAD_REPORT_SUBDIR}"
 mkdir -p "${WORK_DIR}/${VAL_METRICS_SUBDIR}"
 if [[ "${EMBEDDING_DIAGNOSTICS_ENABLE}" == "true" ]]; then
   mkdir -p "${WORK_DIR}/${EMBEDDING_DIAGNOSTICS_SUBDIR}"
+  mkdir -p "${WORK_DIR}/${EMBEDDING_DIAGNOSTICS_LOG_SUBDIR}"
+  mkdir -p "${WORK_DIR}/${EMBEDDING_DIAGNOSTICS_LOAD_REPORT_SUBDIR}"
 fi
 
 summary_path="${WORK_DIR}/${VAL_SUMMARY_FILE}"
 if [[ ! -f "${summary_path}" ]]; then
   printf "epoch\talign_ckpt\tval_loss_align\ti2t_top1\tt2i_top1\ti2t_r5\ti2t_r10\tt2i_r5\tt2i_r10\tval_log\tload_report\n" > "${summary_path}"
+fi
+
+diagnostics_summary_path="${WORK_DIR}/${EMBEDDING_DIAGNOSTICS_SUMMARY_FILE}"
+if [[ ! -f "${diagnostics_summary_path}" ]]; then
+  printf "epoch\talign_ckpt\tdiagnostics_ann\tval_loss_align\ti2t_top1\tt2i_top1\ti2t_r5\ti2t_r10\tt2i_r5\tt2i_r10\tembedding_diagnostics\tdiagnostics_log\tdiagnostics_load_report\n" > "${diagnostics_summary_path}"
 fi
 
 echo "[INFO] Repo root: ${REPO_ROOT}"
@@ -147,7 +159,10 @@ echo "[INFO] Val logs  : ${WORK_DIR}/${VAL_LOG_SUBDIR}"
 echo "[INFO] Val summary: ${summary_path}"
 echo "[INFO] Val metrics json: ${WORK_DIR}/${VAL_METRICS_SUBDIR}"
 echo "[INFO] Embedding diagnostics: enable=${EMBEDDING_DIAGNOSTICS_ENABLE}, dir=${WORK_DIR}/${EMBEDDING_DIAGNOSTICS_SUBDIR}"
+echo "[INFO] Embedding diagnostics interval: ${EMBEDDING_DIAGNOSTICS_INTERVAL}"
+echo "[INFO] Embedding diagnostics summary: ${diagnostics_summary_path}"
 echo "[INFO] Diagnostics subset: enable=${DIAGNOSTICS_SUBSET_ONE_PER_SCENE}, path=${DIAGNOSTICS_SUBSET_PATH}"
+echo "[INFO] Diagnostics subset clip length: ${DIAGNOSTICS_SUBSET_CLIP_LENGTH}"
 echo "[INFO] Auto compare export: ${AUTO_EXPORT_COMPARE}"
 if [[ "${NNODES}" -gt 1 ]]; then
   echo "[INFO] GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-<empty>}"
@@ -166,6 +181,11 @@ fi
 
 if [[ "${SERIAL_LR_POLICY}" != "config" && "${SERIAL_LR_POLICY}" != "Fixed" ]]; then
   echo "[ERROR] SERIAL_LR_POLICY must be config or Fixed, got: ${SERIAL_LR_POLICY}"
+  exit 1
+fi
+
+if [[ "${EMBEDDING_DIAGNOSTICS_ENABLE}" == "true" && "${EMBEDDING_DIAGNOSTICS_INTERVAL}" -lt 1 ]]; then
+  echo "[ERROR] EMBEDDING_DIAGNOSTICS_INTERVAL must be >= 1 when EMBEDDING_DIAGNOSTICS_ENABLE=true"
   exit 1
 fi
 
@@ -197,18 +217,21 @@ compute_file_sha256() {
 ensure_one_per_scene_subset() {
   local source_ann="$1"
   local subset_ann="$2"
+  local clip_length="$3"
 
   if [[ -f "${subset_ann}" ]]; then
     return 0
   fi
 
   mkdir -p "$(dirname "${subset_ann}")"
-  python - "${source_ann}" "${subset_ann}" <<'PY'
+  python - "${source_ann}" "${subset_ann}" "${clip_length}" <<'PY'
 import pickle
 import sys
+from collections import defaultdict
 
 source_ann = sys.argv[1]
 subset_ann = sys.argv[2]
+clip_length = max(int(sys.argv[3]), 1)
 with open(source_ann, 'rb') as f:
     data = pickle.load(f)
 
@@ -221,22 +244,26 @@ elif isinstance(data, list):
 else:
     raise ValueError('Unsupported ann_file structure: {}'.format(type(data).__name__))
 
-seen = set()
-subset_infos = []
+by_scene = defaultdict(list)
 for info in infos:
-    scene_token = info.get('scene_token', None)
-    if scene_token is None or scene_token in seen:
-        continue
-    seen.add(scene_token)
-    subset_infos.append(info)
+  scene_token = info.get('scene_token', None)
+  if scene_token is None:
+    continue
+  by_scene[scene_token].append(info)
+
+subset_infos = []
+for scene_token, scene_infos in by_scene.items():
+  scene_infos.sort(key=lambda info: int(info.get('frame_idx', 0)))
+  subset_infos.extend(scene_infos[:clip_length])
 
 with open(subset_ann, 'wb') as f:
     pickle.dump({'infos': subset_infos, 'metadata': metadata}, f)
 
-print('Saved diagnostics subset: {} (samples={}, unique_scenes={})'.format(
+print('Saved diagnostics subset: {} (samples={}, unique_scenes={}, clip_length={})'.format(
     subset_ann,
     len(subset_infos),
-    len(seen),
+  len(by_scene),
+  clip_length,
 ))
 PY
 }
@@ -426,6 +453,17 @@ resolve_diagnostics_ann() {
   echo "${VAL_ANN}"
 }
 
+should_run_embedding_diagnostics() {
+  local epoch="$1"
+  if [[ "${EMBEDDING_DIAGNOSTICS_ENABLE}" != "true" ]]; then
+    return 1
+  fi
+  if (( epoch % EMBEDDING_DIAGNOSTICS_INTERVAL != 0 )); then
+    return 1
+  fi
+  return 0
+}
+
 for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
   prev_epoch=$((epoch - 1))
 
@@ -552,31 +590,14 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
   val_log="${WORK_DIR}/${VAL_LOG_SUBDIR}/epoch_${epoch}.log"
   load_report="${WORK_DIR}/${VAL_LOAD_REPORT_SUBDIR}/align_trainable_epoch_${epoch}.json"
   metrics_json="${WORK_DIR}/${VAL_METRICS_SUBDIR}/epoch_${epoch}.json"
-  embedding_diagnostics=""
   val_cfg_opts=(
     model.run_mode=offline_infer_validate
     model.offline_split=val
     model.scene_json="${SCENE_JSON}"
     data.val.offline_unique_anchor="${OFFLINE_UNIQUE_ANCHOR}"
   )
-  if [[ "${DIAGNOSTICS_OFFLINE_META_ONLY}" == "true" ]]; then
-    val_cfg_opts+=(data.val.offline_meta_only=True)
-  fi
   if [[ -n "${VAL_ANN}" ]]; then
     val_cfg_opts+=(data.val.ann_file="${VAL_ANN}")
-  fi
-  if [[ "${EMBEDDING_DIAGNOSTICS_ENABLE}" == "true" ]]; then
-    embedding_diagnostics="${WORK_DIR}/${EMBEDDING_DIAGNOSTICS_SUBDIR}/$(printf "${EMBEDDING_DIAGNOSTICS_NAME_TEMPLATE}" "${epoch}")"
-    diagnostics_ann="$(resolve_diagnostics_ann)"
-    if [[ -z "${diagnostics_ann}" ]]; then
-      echo "[ERROR] EMBEDDING_DIAGNOSTICS_ENABLE=true but no diagnostics ann_file is available."
-      exit 1
-    fi
-    if [[ "${DIAGNOSTICS_SUBSET_ONE_PER_SCENE}" == "true" ]]; then
-      ensure_one_per_scene_subset "${diagnostics_ann}" "${DIAGNOSTICS_SUBSET_PATH}"
-      diagnostics_ann="${DIAGNOSTICS_SUBSET_PATH}"
-    fi
-    val_cfg_opts+=(data.val.ann_file="${diagnostics_ann}")
   fi
 
   validate_cmd=(
@@ -588,9 +609,6 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
     --samples-per-gpu "${VAL_SAMPLES_PER_GPU}"
     --workers-per-gpu "${VAL_WORKERS_PER_GPU}"
   )
-  if [[ -n "${embedding_diagnostics}" ]]; then
-    validate_cmd+=(--dump-embedding-diagnostics "${embedding_diagnostics}")
-  fi
   validate_cmd+=(--cfg-options "${val_cfg_opts[@]}")
 
   set +e
@@ -642,9 +660,6 @@ EOF
   echo "[INFO] Saved val log: ${val_log}"
   echo "[INFO] Updated val summary: ${summary_path}"
   echo "[INFO] Saved val metrics json: ${metrics_json}"
-  if [[ -n "${embedding_diagnostics}" ]]; then
-    echo "[INFO] Saved embedding diagnostics: ${embedding_diagnostics}"
-  fi
 
   if [[ "${AUTO_EXPORT_COMPARE}" == "true" ]]; then
     if [[ "${COMPARE_TSV_NAME}" = /* ]]; then
@@ -709,6 +724,84 @@ EOF
     echo "[ERROR] Validation failed at epoch ${epoch} with exit code ${val_rc}."
     echo "[ERROR] Metrics were still saved. Please inspect ${val_log} and ${metrics_json}."
     exit "${val_rc}"
+  fi
+
+  if should_run_embedding_diagnostics "${epoch}"; then
+    echo "[INFO] ===== Epoch ${epoch}: embedding diagnostics ====="
+    diagnostics_ann="$(resolve_diagnostics_ann)"
+    if [[ -z "${diagnostics_ann}" ]]; then
+      echo "[ERROR] EMBEDDING_DIAGNOSTICS_ENABLE=true but no diagnostics ann_file is available."
+      exit 1
+    fi
+    if [[ "${DIAGNOSTICS_SUBSET_ONE_PER_SCENE}" == "true" ]]; then
+      ensure_one_per_scene_subset "${diagnostics_ann}" "${DIAGNOSTICS_SUBSET_PATH}" "${DIAGNOSTICS_SUBSET_CLIP_LENGTH}"
+      diagnostics_ann="${DIAGNOSTICS_SUBSET_PATH}"
+    fi
+
+    diagnostics_log="${WORK_DIR}/${EMBEDDING_DIAGNOSTICS_LOG_SUBDIR}/epoch_${epoch}.log"
+    diagnostics_load_report="${WORK_DIR}/${EMBEDDING_DIAGNOSTICS_LOAD_REPORT_SUBDIR}/align_trainable_epoch_${epoch}.json"
+    embedding_diagnostics="${WORK_DIR}/${EMBEDDING_DIAGNOSTICS_SUBDIR}/$(printf "${EMBEDDING_DIAGNOSTICS_NAME_TEMPLATE}" "${epoch}")"
+    diagnostics_cfg_opts=(
+      model.run_mode=offline_infer_validate
+      model.offline_split=val
+      model.scene_json="${SCENE_JSON}"
+      data.val.offline_unique_anchor="${OFFLINE_UNIQUE_ANCHOR}"
+      data.val.ann_file="${diagnostics_ann}"
+    )
+    if [[ "${DIAGNOSTICS_OFFLINE_META_ONLY}" == "true" ]]; then
+      diagnostics_cfg_opts+=(data.val.offline_meta_only=True)
+    fi
+
+    diagnostics_cmd=(
+      python tools/validate_vlm_align.py
+      "${CONFIG}"
+      --base-ckpt "${BASE_CKPT}"
+      --align-ckpt "${align_ckpt}"
+      --load-report "${diagnostics_load_report}"
+      --dump-embedding-diagnostics "${embedding_diagnostics}"
+      --samples-per-gpu "${VAL_SAMPLES_PER_GPU}"
+      --workers-per-gpu "${VAL_WORKERS_PER_GPU}"
+      --cfg-options "${diagnostics_cfg_opts[@]}"
+    )
+
+    set +e
+    CUDA_VISIBLE_DEVICES="${VAL_CUDA_VISIBLE_DEVICES}" \
+    "${diagnostics_cmd[@]}" \
+      2>&1 | tee "${diagnostics_log}"
+    diagnostics_rc=${PIPESTATUS[0]}
+    set -e
+
+    diagnostics_val_loss_align=$(grep -E '^val_loss_align:' "${diagnostics_log}" | tail -1 | awk -F': ' '{print $2}')
+    diagnostics_i2t_top1=$(grep -E '^i2t_top1:' "${diagnostics_log}" | tail -1 | awk -F': ' '{print $2}')
+    diagnostics_t2i_top1=$(grep -E '^t2i_top1:' "${diagnostics_log}" | tail -1 | awk -F': ' '{print $2}')
+    diagnostics_i2t_r5=$(grep -E '^i2t_r5:' "${diagnostics_log}" | tail -1 | awk -F': ' '{print $2}')
+    diagnostics_i2t_r10=$(grep -E '^i2t_r10:' "${diagnostics_log}" | tail -1 | awk -F': ' '{print $2}')
+    diagnostics_t2i_r5=$(grep -E '^t2i_r5:' "${diagnostics_log}" | tail -1 | awk -F': ' '{print $2}')
+    diagnostics_t2i_r10=$(grep -E '^t2i_r10:' "${diagnostics_log}" | tail -1 | awk -F': ' '{print $2}')
+
+    diagnostics_val_loss_align=${diagnostics_val_loss_align:-NA}
+    diagnostics_i2t_top1=${diagnostics_i2t_top1:-NA}
+    diagnostics_t2i_top1=${diagnostics_t2i_top1:-NA}
+    diagnostics_i2t_r5=${diagnostics_i2t_r5:-NA}
+    diagnostics_i2t_r10=${diagnostics_i2t_r10:-NA}
+    diagnostics_t2i_r5=${diagnostics_t2i_r5:-NA}
+    diagnostics_t2i_r10=${diagnostics_t2i_r10:-NA}
+
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+      "${epoch}" "${align_ckpt}" "${diagnostics_ann}" "${diagnostics_val_loss_align}" "${diagnostics_i2t_top1}" "${diagnostics_t2i_top1}" \
+      "${diagnostics_i2t_r5}" "${diagnostics_i2t_r10}" "${diagnostics_t2i_r5}" "${diagnostics_t2i_r10}" "${embedding_diagnostics}" "${diagnostics_log}" "${diagnostics_load_report}" \
+      >> "${diagnostics_summary_path}"
+
+    echo "[INFO] Saved diagnostics log: ${diagnostics_log}"
+    echo "[INFO] Saved diagnostics load report: ${diagnostics_load_report}"
+    echo "[INFO] Saved embedding diagnostics: ${embedding_diagnostics}"
+    echo "[INFO] Updated diagnostics summary: ${diagnostics_summary_path}"
+
+    if [[ "${diagnostics_rc}" -ne 0 ]]; then
+      echo "[ERROR] Embedding diagnostics failed at epoch ${epoch} with exit code ${diagnostics_rc}."
+      echo "[ERROR] Please inspect ${diagnostics_log}."
+      exit "${diagnostics_rc}"
+    fi
   fi
 
 done

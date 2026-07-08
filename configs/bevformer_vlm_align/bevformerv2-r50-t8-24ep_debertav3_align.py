@@ -58,7 +58,7 @@ model = dict(
     use_feature_queue=True,
     use_multi_positive=True,
     feature_queue_size=128,
-    feature_queue_warmup_steps=50,
+    feature_queue_warmup_steps=300,
     queue_use_scene_mask=True,
     # Enable BF16 runtime for frozen backbones and alignment head.
     use_bf16_amp=True,
@@ -96,7 +96,7 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=1e-5,
+    lr=5e-5,
     weight_decay=0.01,
 )
 optimizer_config = dict(
@@ -109,9 +109,9 @@ lr_config = dict(
     _delete_=True,
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=20,
+    warmup_iters=50,
     warmup_ratio=0.2,
-    min_lr_ratio=0.1,
+    min_lr_ratio=1e-4,
 )
 
 total_epochs = 20

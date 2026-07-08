@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 from mmcv import Config
@@ -40,6 +41,11 @@ def parse_args():
         '--embedding-diagnostics-name-template',
         default='embedding_diag_epoch_{epoch}.json',
         help='output filename template inside embedding-diagnostics-dir')
+    parser.add_argument(
+        '--embedding-diagnostics-interval',
+        type=int,
+        default=1,
+        help='run embedding diagnostics every N validated epochs when enabled')
     parser.add_argument(
         '--diagnostics-ann-file',
         default=None,
@@ -114,10 +120,12 @@ def save_summary(summary_path: Path, records):
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 
-def ensure_one_per_scene_subset(source_ann: Path, subset_ann: Path):
+def ensure_one_per_scene_subset(source_ann: Path, subset_ann: Path, clip_length: int):
     subset_ann.parent.mkdir(parents=True, exist_ok=True)
     if subset_ann.exists():
         return subset_ann
+
+    clip_length = max(int(clip_length), 1)
 
     with source_ann.open('rb') as f:
         data = pickle.load(f)
@@ -131,24 +139,28 @@ def ensure_one_per_scene_subset(source_ann: Path, subset_ann: Path):
     else:
         raise ValueError('Unsupported ann_file structure for subset generation: {}'.format(type(data).__name__))
 
-    seen = set()
-    subset_infos = []
+    by_scene = defaultdict(list)
     for info in infos:
         scene_token = info.get('scene_token', None)
-        if scene_token is None or scene_token in seen:
+        if scene_token is None:
             continue
-        seen.add(scene_token)
-        subset_infos.append(info)
+        by_scene[scene_token].append(info)
+
+    subset_infos = []
+    for scene_token, scene_infos in by_scene.items():
+        scene_infos.sort(key=lambda info: int(info.get('frame_idx', 0)))
+        subset_infos.extend(scene_infos[:clip_length])
 
     subset_data = {'infos': subset_infos, 'metadata': metadata}
     with subset_ann.open('wb') as f:
         pickle.dump(subset_data, f)
 
     print(
-        'Saved diagnostics subset: {} (samples={}, unique_scenes={})'.format(
+        'Saved diagnostics subset: {} (samples={}, unique_scenes={}, clip_length={})'.format(
             subset_ann,
             len(subset_infos),
-            len(seen),
+            len(by_scene),
+            clip_length,
         )
     )
     return subset_ann
@@ -167,12 +179,14 @@ def resolve_diagnostics_ann_file(args, cfg, work_dir: Path):
         if subset_path is None:
             subset_path = work_dir / 'tmp_val_one_per_scene.pkl'
         subset_path = Path(subset_path)
-        return ensure_one_per_scene_subset(ann_path, subset_path)
+        frames = cfg.data.val.get('frames', None)
+        clip_length = len(frames) if frames is not None else 40
+        return ensure_one_per_scene_subset(ann_path, subset_path, clip_length)
 
     return ann_path
 
 
-def build_validate_cfg_overrides(args, cfg, diagnostics_ann_file=None):
+def build_validate_cfg_overrides(args, cfg, diagnostics_ann_file=None, force_offline_meta_only=False):
     overrides = []
     train_extra = list(getattr(args, 'train_extra', []) or [])
     offline_train_mode = any(x.startswith('model.run_mode=offline_train') for x in train_extra)
@@ -181,7 +195,7 @@ def build_validate_cfg_overrides(args, cfg, diagnostics_ann_file=None):
             'model.run_mode=offline_infer_validate',
             'model.offline_split=val',
         ])
-        if args.diagnostics_offline_meta_only or args.dump_embedding_diagnostics:
+        if force_offline_meta_only:
             overrides.append('data.val.offline_meta_only=True')
 
     scene_json_override = args.diagnostics_scene_json
@@ -196,7 +210,22 @@ def build_validate_cfg_overrides(args, cfg, diagnostics_ann_file=None):
     return overrides
 
 
-def run_validate(args, config_path, base_ckpt, align_ckpt, work_dir: Path):
+def should_run_embedding_diagnostics(args, epoch: int):
+    return args.dump_embedding_diagnostics and args.embedding_diagnostics_interval > 0 and epoch % args.embedding_diagnostics_interval == 0
+
+
+def _run_validate_subprocess(
+    args,
+    config_path,
+    base_ckpt,
+    align_ckpt,
+    work_dir: Path,
+    *,
+    load_report_dir_name,
+    diagnostics_path=None,
+    diagnostics_ann_file=None,
+    force_offline_meta_only=False,
+):
     epoch = extract_epoch_from_name(align_ckpt)
     cmd = [
         sys.executable,
@@ -212,12 +241,12 @@ def run_validate(args, config_path, base_ckpt, align_ckpt, work_dir: Path):
         str(args.workers_per_gpu),
     ]
 
-    diagnostics_ann_file = None
-    if args.dump_embedding_diagnostics and (args.diagnostics_ann_file or args.diagnostics_subset_one_per_scene):
-        cfg = Config.fromfile(config_path)
-        diagnostics_ann_file = resolve_diagnostics_ann_file(args, cfg, work_dir)
-
-    cfg_overrides = build_validate_cfg_overrides(args, Config.fromfile(config_path), diagnostics_ann_file)
+    cfg_overrides = build_validate_cfg_overrides(
+        args,
+        Config.fromfile(config_path),
+        diagnostics_ann_file,
+        force_offline_meta_only=force_offline_meta_only,
+    )
     if cfg_overrides:
         cmd.append('--cfg-options')
         cmd.extend(cfg_overrides)
@@ -227,17 +256,12 @@ def run_validate(args, config_path, base_ckpt, align_ckpt, work_dir: Path):
     if args.fail_on_unexpected_keys:
         cmd.append('--fail-on-unexpected-keys')
 
-    load_report_dir = work_dir / args.load_report_dir
+    load_report_dir = work_dir / load_report_dir_name
     load_report_dir.mkdir(parents=True, exist_ok=True)
     load_report_path = load_report_dir / (align_ckpt.stem + '.json')
     cmd.extend(['--load-report', str(load_report_path)])
 
-    diagnostics_path = None
-    if args.dump_embedding_diagnostics:
-        diagnostics_dir = work_dir / args.embedding_diagnostics_dir
-        diagnostics_dir.mkdir(parents=True, exist_ok=True)
-        diagnostics_name = args.embedding_diagnostics_name_template.format(epoch=epoch)
-        diagnostics_path = diagnostics_dir / diagnostics_name
+    if diagnostics_path is not None:
         cmd.extend(['--dump-embedding-diagnostics', str(diagnostics_path)])
 
     env = os.environ.copy()
@@ -245,6 +269,18 @@ def run_validate(args, config_path, base_ckpt, align_ckpt, work_dir: Path):
         env['CUDA_VISIBLE_DEVICES'] = str(args.val_cuda_visible_devices)
 
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    return load_report_path, diagnostics_path, proc
+
+
+def run_validate(args, config_path, base_ckpt, align_ckpt, work_dir: Path):
+    load_report_path, diagnostics_path, proc = _run_validate_subprocess(
+        args,
+        config_path,
+        base_ckpt,
+        align_ckpt,
+        work_dir,
+        load_report_dir_name=args.load_report_dir,
+    )
     val_loss_align, i2t, t2i = parse_metrics(proc.stdout)
 
     return {
@@ -261,6 +297,41 @@ def run_validate(args, config_path, base_ckpt, align_ckpt, work_dir: Path):
     }
 
 
+def run_embedding_diagnostics(args, config_path, base_ckpt, align_ckpt, work_dir: Path):
+    epoch = extract_epoch_from_name(align_ckpt)
+    cfg = Config.fromfile(config_path)
+    diagnostics_ann_file = resolve_diagnostics_ann_file(args, cfg, work_dir)
+
+    diagnostics_dir = work_dir / args.embedding_diagnostics_dir
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_name = args.embedding_diagnostics_name_template.format(epoch=epoch)
+    diagnostics_path = diagnostics_dir / diagnostics_name
+
+    load_report_path, _, proc = _run_validate_subprocess(
+        args,
+        config_path,
+        base_ckpt,
+        align_ckpt,
+        work_dir,
+        load_report_dir_name='embedding_diagnostics_load_reports',
+        diagnostics_path=diagnostics_path,
+        diagnostics_ann_file=diagnostics_ann_file,
+        force_offline_meta_only=args.diagnostics_offline_meta_only,
+    )
+
+    return {
+        'embedding_diagnostics': str(diagnostics_path),
+        'diagnostics_load_report': str(load_report_path),
+        'diagnostics_returncode': proc.returncode,
+        'diagnostics_stdout': proc.stdout,
+        'diagnostics_stderr': proc.stderr,
+    }
+
+
+def record_failed(rec):
+    return rec['returncode'] != 0 or rec.get('diagnostics_returncode', 0) != 0
+
+
 def main():
     args = parse_args()
     config_path = args.config
@@ -268,6 +339,9 @@ def main():
     cfg = Config.fromfile(config_path)
     work_dir = infer_work_dir(cfg, config_path, args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.dump_embedding_diagnostics and args.embedding_diagnostics_interval < 1:
+        raise ValueError('--embedding-diagnostics-interval must be >= 1 when diagnostics export is enabled.')
 
     base_ckpt = args.base_ckpt or cfg.get('load_from', None)
     if base_ckpt is None:
@@ -306,11 +380,13 @@ def main():
 
                     print('Validate new checkpoint: {}'.format(ckpt_s))
                     rec = run_validate(args, config_path, base_ckpt, ckpt, work_dir)
+                    if should_run_embedding_diagnostics(args, rec['epoch']):
+                        rec.update(run_embedding_diagnostics(args, config_path, base_ckpt, ckpt, work_dir))
                     records.append(rec)
                     seen.add(ckpt_s)
                     save_summary(summary_path, records)
 
-                    if rec['returncode'] != 0:
+                    if record_failed(rec):
                         print('Validation failed on {} with code {}'.format(ckpt_s, rec['returncode']))
                         if rec.get('stderr'):
                             print('Validation stderr (tail):')
@@ -318,6 +394,14 @@ def main():
                         elif rec.get('stdout'):
                             print('Validation stdout (tail):')
                             print('\n'.join(rec['stdout'].splitlines()[-30:]))
+                        if rec.get('diagnostics_returncode', 0) != 0:
+                            print('Diagnostics failed on {} with code {}'.format(ckpt_s, rec['diagnostics_returncode']))
+                            if rec.get('diagnostics_stderr'):
+                                print('Diagnostics stderr (tail):')
+                                print('\n'.join(rec['diagnostics_stderr'].splitlines()[-30:]))
+                            elif rec.get('diagnostics_stdout'):
+                                print('Diagnostics stdout (tail):')
+                                print('\n'.join(rec['diagnostics_stdout'].splitlines()[-30:]))
                         if args.stop_on_val_fail and train_proc.poll() is None:
                             train_proc.terminate()
 
@@ -334,6 +418,8 @@ def main():
                         continue
                     print('Validate late checkpoint: {}'.format(ckpt_s))
                     rec = run_validate(args, config_path, base_ckpt, ckpt, work_dir)
+                    if should_run_embedding_diagnostics(args, rec['epoch']):
+                        rec.update(run_embedding_diagnostics(args, config_path, base_ckpt, ckpt, work_dir))
                     records.append(rec)
                     seen.add(ckpt_s)
                     save_summary(summary_path, records)
@@ -344,7 +430,7 @@ def main():
         if train_proc.poll() is None:
             train_proc.terminate()
 
-    failed_val = [r for r in records if r['returncode'] != 0]
+    failed_val = [r for r in records if record_failed(r)]
     print('Validation summary saved to: {}'.format(summary_path))
 
     if train_proc.returncode not in (0, None):
