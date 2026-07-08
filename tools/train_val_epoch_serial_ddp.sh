@@ -640,7 +640,7 @@ for epoch in $(seq "${START_EPOCH}" "${END_EPOCH}"); do
   "epoch": ${epoch},
   "align_ckpt": "${align_ckpt}",
   "load_report": "${load_report}",
-  "embedding_diagnostics": "${embedding_diagnostics}",
+  "embedding_diagnostics": null,
   "val_log": "${val_log}",
   "val_return_code": ${val_rc},
   "val_loss_align": "${val_loss_align}",
