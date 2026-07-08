@@ -1,3 +1,4 @@
 from .custom_hooks import TransferWeight
 from .custom_hooks import SaveTrainableStateDictHook
+from .custom_hooks import StopAfterTargetEpochHook
 from .custom_hooks import DebugTrainableUpdateHook

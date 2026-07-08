@@ -72,6 +72,27 @@ class SaveTrainableStateDictHook(Hook):
 
 
 @HOOKS.register_module()
+class StopAfterTargetEpochHook(Hook):
+    """Stop an epoch-based run right after a target human epoch finishes."""
+
+    def __init__(self, target_epoch):
+        self.target_epoch = int(target_epoch)
+
+    def after_train_epoch(self, runner):
+        completed_epoch = runner.epoch + 1
+        if completed_epoch < self.target_epoch:
+            return
+
+        current_limit = getattr(runner, '_max_epochs', completed_epoch)
+        new_limit = min(int(current_limit), completed_epoch)
+        runner._max_epochs = new_limit
+        if hasattr(runner, 'logger'):
+            runner.logger.info(
+                'StopAfterTargetEpochHook: completed epoch %d, clamp max_epochs to %d.'
+                % (completed_epoch, new_limit))
+
+
+@HOOKS.register_module()
 class DebugTrainableUpdateHook(Hook):
     """Periodically log lr/grad/update stats of key trainable parameters."""
 

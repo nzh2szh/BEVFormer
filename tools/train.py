@@ -115,6 +115,30 @@ def _sanitize_lr_config(cfg):
         lr_cfg.pop('min_lr', None)
 
 
+def _inject_serial_stop_hook(cfg):
+    """Append a stop hook used by serial one-epoch-per-launch training."""
+    target_epoch = cfg.pop('serial_stop_after_epoch', None)
+    if target_epoch is None:
+        return
+
+    hook_cfg = dict(type='StopAfterTargetEpochHook', target_epoch=int(target_epoch))
+    custom_hooks = cfg.get('custom_hooks', None)
+    if custom_hooks is None:
+        cfg.custom_hooks = [hook_cfg]
+        return
+
+    if not isinstance(custom_hooks, list):
+        custom_hooks = list(custom_hooks)
+        cfg.custom_hooks = custom_hooks
+
+    for existing in custom_hooks:
+        if isinstance(existing, dict) and existing.get('type', None) == 'StopAfterTargetEpochHook':
+            existing['target_epoch'] = int(target_epoch)
+            return
+
+    custom_hooks.append(hook_cfg)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('config', help='train config file path')
@@ -192,6 +216,7 @@ def main():
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
     _sanitize_lr_config(cfg)
+    _inject_serial_stop_hook(cfg)
     _boot_debug('config loaded and merged')
     # import modules from string list.
     if cfg.get('custom_imports', None):

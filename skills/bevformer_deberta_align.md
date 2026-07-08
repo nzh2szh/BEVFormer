@@ -11,6 +11,17 @@ tools: [ "#codebase", "#terminal" ]
 - 程序的作用之一是验证训练后的模型，做Validation。
 
 # 训练方案架构描述
+
+## 当前实现更新（2026-07-08）
+
+当前对齐模型已经从早期的“Temporal CLS + Vision/Text Projector”单一路径，扩展为可配置的多种视觉池化和诊断友好结构。默认实验配置重点用于缓解 vision embedding collapse / hubness：
+
+- 视觉侧支持 `vision_pooling={cls, frame_mean, spatial_mean, temporal_attn, netvlad}`。
+- 当前推荐配置使用 `vision_pooling=netvlad`，通过多簇残差池化聚合时序帧 token。
+- `use_vision_projector` 和 `use_text_projector` 都是可开关项；当前 NetVLAD 结构实验中默认关闭 projector，减少额外投影层把特征压到公共方向的风险。
+- 新增 `vision_batch_centering_weight` 和 `vision_covariance_reg_weight`，用于约束视觉 embedding 的公共方向、低方差维度和维度相关性。
+- 验证脚本可导出最终 embedding 与中间层 embedding 诊断，用于定位 collapse 发生在 spatial pooling、temporal encoder、NetVLAD、projector 还是 normalize 后。
+
 ## 流程图1
 
 【 图像塔 (Vision Tower) 】                               【 文本塔 (Text Tower) 】
@@ -39,11 +50,11 @@ tools: [ "#codebase", "#terminal" ]
      3层 Lightweight Transformer                                       L2 Normalize
     [41, 768] 帧间/全局多层交互                                              │
                 │                                                           ▼
-                ▼ 提取第 0 位 [CLS] 向量                              [B, 768] 最终文本向量
+                ▼ 多策略视觉池化                                      [B, 768] 最终文本向量
             [B, 768]                                                        │
                 │                                                           │
-                ▼ Vision Projector                                          │
-            (独立对齐映射层, 参与训练)                                        │
+                ▼ Optional Vision Projector                                 │
+            (可开关/可残差插值的对齐映射层)                                    │
                 │                                                           │
                 ▼                                                           │
            L2 Normalize                                                     │
@@ -82,12 +93,18 @@ tools: [ "#codebase", "#terminal" ]
 - 在时序 Transformer 前注入1D 时序位置编码 (Temporal PE)，确保模型能识别“先做什么、后做什么”的动作先后顺序。
 - 将 [41, 768] 的张量送入一个由 3 层组成的轻量级时序 Transformer Encoder。在多层 Self-Attention 的作用下，第 0 位的 [CLS] Token 吸取和概括后面 40 帧图像中的所有因果、时序、空间变化信息。
 
-7. 提取第 0 位 [CLS] 并归一化
-- 通过切片操作，模型抛弃后面 1 至 40 位的具体帧特征，仅仅提取出第 0 位的 [CLS] 向量。此时引入 Batch Size (B)，张量收拢为 [B, 768] 的二维矩阵（视频全局特征）。
+7. 多策略视觉池化并归一化
+- 当前实现不再只固定提取第 0 位 [CLS] 向量，而是通过 `vision_pooling` 选择视觉全局表征：
+    - `cls`: 使用 temporal encoder 输出的第 0 位 [CLS] token。
+    - `frame_mean`: 对 temporal encoder 输出的帧 token 求均值。
+    - `spatial_mean`: 在时序编码前，对 spatial pooling 后的帧表征求均值。
+    - `temporal_attn`: 使用一个可学习 temporal query 对帧 token 做 MultiheadAttention 池化。
+    - `netvlad`: 对 temporal encoder 输出的帧 token 做多簇残差池化，再投影回 768 维。
+- 当前抗 collapse 实验推荐使用 `netvlad`，其目标是避免所有片段被压缩到单一全局方向。
 
-8. 投影映射层与归一化
-- 基于 Contrastive Manifold Alignment（对比流形对齐） 策略，增加 Vision Projector 进行线性/非线性流形变换。
-- 经过 L2 Normalize（L2 归一化），消除尺度影响，得到用于对齐的 [B, 768] 最终视觉向量。
+8. Optional 投影映射层与归一化
+- Vision Projector 现在是可选模块。`use_vision_projector=True` 时，可通过 `vision_projector_residual_weight` 在 raw vision feature 和 projector output 之间做残差插值；`False` 时直接使用池化后的 raw vision feature。
+- 最终统一经过 L2 Normalize（L2 归一化），消除尺度影响，得到用于对齐的 [B, 768] 最终视觉向量。
 
 ## 文本塔数据流
 文本塔的目标是将自然语言描述，转化为与视觉向量处于同一几何超平面的 [B, 768] 向量。
@@ -108,9 +125,27 @@ tools: [ "#codebase", "#terminal" ]
 5. 生成固定句向量
 - 消除变长序列长度后，张量完美坍缩为固定大小的 [B, 768] 变长句向量。
 
-6. 投影映射层与归一化
-- 由于 DeBERTa 是冻结的，生来与视觉空间不通，因此需要将其送入一个可训练的 Text Projector（同维对齐映射层） 进行线性/非线性流形变换。
+6. Optional 投影映射层与归一化
+- Text Projector 现在是可选模块。`use_text_projector=True` 时使用可训练 Text Projector；`False` 时直接使用 DeBERTa masked mean pooled feature。
 - 随后同样进行 L2 Normalize（L2 归一化），最终吐出标准规格的 [B, 768] 最终文本向量。
+
+## 视觉几何正则
+
+为缓解训练中观察到的 vision embedding 近似同向、检索结果 hubness 严重等问题，当前实现新增两个视觉侧辅助 loss：
+
+- `loss_vision_centering`: 惩罚 batch 内视觉特征均值向量的平方范数，降低 dominant common direction。
+- `loss_vision_covariance`: 对视觉特征先按维度标准化，再惩罚低方差维度和 off-diagonal correlation，形式接近 VICReg 的 variance/covariance 约束。
+
+推荐起始配置：
+
+- `vision_batch_centering_weight=0.05`
+- `vision_covariance_reg_weight=0.04`
+
+注意事项：
+
+- 几何正则默认使用 gather 后的全局 batch 特征，与 `gather_ddp=True` 配合。
+- 该正则作用于 vision feature geometry，不改变验证阶段的相似度计算方式。
+- 若 loss_align 明显不收敛，需要分别关掉 centering/covariance 做消融，判断是否正则权重过强。
 
 ## 跨模态对齐交互
 当左塔吐出 [B, 768] 的视觉向量，右塔吐出 [B, 768] 的文本向量后，两边在最底层完成闭环。
@@ -137,9 +172,11 @@ tools: [ "#codebase", "#terminal" ]
 - 路径：通过 Hugging Face 下载 “microsoft/deberta-v3-base” 相关。
 
 3. 中间新增的对齐环节
-- 包含内容：空间 Attention Pooling 层、Linear 升维层（256 -> 768）、3层轻量级时序 Transformer、以及文本侧的 Text Projector。
+- 包含内容：空间 Attention Pooling 层、Linear 升维层（256 -> 768）、3层轻量级时序 Transformer、Temporal Attention Pooling、NetVLAD Pooling、Vision/Text Projector、logit_scale、Feature Queue 等对齐相关参数。
 - 状态：大幅度更新。这是整个训练过程中唯一在接收梯度、不断优化的部分。
 - 处理：唯一需要使用 torch.save() 保存的就是这一份权重。
+
+当前 `trainable_state_dict()` 需要覆盖新增的 `temporal_pool_query`、`temporal_pool`、`vision_netvlad_assign`、`vision_netvlad_clusters_param`、`vision_netvlad_proj`，避免只保存旧版本对齐头导致恢复训练缺参数。
 
 ## 配置文件
 1. 1份配置文件
@@ -269,4 +306,50 @@ tools: [ "#codebase", "#terminal" ]
 ### 使用 rsync password-file（daemon 模式）支持多机串行多轮 epoch
 - 在脚本内加入自动同步逻辑（仅 rank0 执行）。
 - 非 rank0 节点在下一轮 resume 前会等待断点文件到位，避免“文件未同步就报错”。
+
+## 串行逐 epoch 训练与验证（2026-07-08）
+
+当前推荐使用 `tools/train_val_epoch_serial_ddp.sh` 做 trainval 长跑：每次启动只完成一个目标 epoch，随后立刻跑验证、写入 metrics，再进入下一轮 resume。
+
+### LR 策略
+- `SERIAL_LR_POLICY=config`: 使用配置文件内的 LR scheduler。此时 `SERIAL_TOTAL_EPOCHS` 可以作为 cosine horizon，脚本通过 stop hook 保证单次 train command 仍只跑完当前目标 epoch。
+- `SERIAL_LR_POLICY=Fixed`: 使用固定 LR。若设置 `SERIAL_FIXED_LR`，脚本会同时传入 `optimizer.lr` 和 `serial_resume_optimizer_lr`，避免 resume checkpoint 后 optimizer param_groups 恢复旧 LR。
+
+### StopAfterTargetEpochHook
+- 脚本会按需传入 `serial_stop_after_epoch=<epoch>`。
+- `tools/train.py` 在读取配置后注入 `StopAfterTargetEpochHook`。
+- hook 在目标 epoch 完成后把 runner 的 `_max_epochs` clamp 到当前完成 epoch，从而让每次训练启动只前进一轮。
+
+### Resume 结构兼容
+- 若模型结构变化导致 checkpoint 中 optimizer state 的 parameter group 数量与当前模型不一致，训练入口会 fallback 到只加载模型权重和 runner epoch/iter 状态，不恢复 optimizer state。
+- 该 fallback 适用于新增 NetVLAD、Temporal Attention Pooling 等 trainable 参数后的继续训练。
+- fallback 后仍会应用 `serial_resume_optimizer_lr`，保证固定 LR 模式不会被旧 checkpoint 覆盖。
+
+### 多节点一致性检查
+- 串行脚本会记录并校验 `START_EPOCH`、`END_EPOCH`、`SERIAL_TOTAL_EPOCHS`、`SERIAL_LR_POLICY`、`SERIAL_FIXED_LR`、`DATASET_PROFILE`、`RDZV_ID`。
+- 同时记录 config、detector 文件、`tools/train.py` 的 sha256 指纹。
+- 若两台机器代码或配置不一致，脚本会在启动阶段报错，避免 DDP 运行到参数数量不一致后才失败。
+
+## Embedding Diagnostics（2026-07-08）
+
+当前验证脚本支持导出 embedding 诊断 JSON，用于判断模型是否仍处于 collapse 或 hubness 状态。
+
+### 启用方式
+- 串行脚本中设置 `EMBEDDING_DIAGNOSTICS_ENABLE=true`。
+- 建议同时设置 `DIAGNOSTICS_SUBSET_ONE_PER_SCENE=true`，脚本会生成并复用 `WORK_DIR/tmp_val_one_per_scene.pkl`，每个 scene 只取一个样本，避免重复 clip 影响几何统计。
+- 也可直接调用 `tools/validate_vlm_align.py --dump-embedding-diagnostics <path>`。
+
+### 导出内容
+- i2t rank、positive/negative similarity、max negative similarity、margin、margin_positive_ratio。
+- text-text 和 vision-vision 的 offdiag similarity，用于观察两侧 embedding 是否过度同向。
+- feature geometry：centroid norm、cosine_to_centroid、centered_l2_norm、PCA explained variance、effective rank。
+- hubness：i2t top1 scene frequency、max negative scene frequency、t2i top1 scene frequency。
+- worst cases：margin 最差的样本、真值 scene、预测 scene、分数和 rank。
+- layers：当模型打开 `return_intermediate_feats` 时，导出 `vision_spatial_pooled`、`vision_temporal_cls`、`vision_temporal_frame_mean`、`vision_temporal_attn`、`vision_netvlad`、`vision_pre_norm`、`vision_projector_out`、`vision_final`、`text_raw_pool`、`text_projector_out`、`text_final` 等中间层统计。
+
+### 常用判断
+- 若 `vision_vision.offdiag_similarity` 接近 1，说明视觉侧仍高度坍缩。
+- 若 `text_text.offdiag_similarity` 明显低于 vision，而 vision 接近 1，优先检查视觉池化和视觉正则。
+- 若 `hubness.i2t_top1_scene_frequency.max_ratio` 很高，说明大量 query 被同一个文本吸走，需要关注 common direction 和负样本构成。
+- 若 `layers.vision_netvlad` 已经分散但 `vision_final` 坍缩，优先检查 projector 或 normalize 前后的特征。
 

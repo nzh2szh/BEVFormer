@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import pickle
 import re
 import subprocess
 import sys
@@ -27,6 +28,38 @@ def parse_args():
     parser.add_argument('--poll-seconds', type=float, default=10.0, help='checkpoint polling interval in seconds')
     parser.add_argument('--summary-file', default='align_val_summary.json', help='summary json file name in work dir')
     parser.add_argument('--load-report-dir', default='align_val_load_reports', help='directory name in work dir for per-epoch load reports')
+    parser.add_argument(
+        '--dump-embedding-diagnostics',
+        action='store_true',
+        help='dump per-epoch embedding diagnostics json during validation')
+    parser.add_argument(
+        '--embedding-diagnostics-dir',
+        default='embedding_diagnostics',
+        help='directory name in work dir for per-epoch embedding diagnostics json')
+    parser.add_argument(
+        '--embedding-diagnostics-name-template',
+        default='embedding_diag_epoch_{epoch}.json',
+        help='output filename template inside embedding-diagnostics-dir')
+    parser.add_argument(
+        '--diagnostics-ann-file',
+        default=None,
+        help='optional ann_file override used only for diagnostics export')
+    parser.add_argument(
+        '--diagnostics-scene-json',
+        default=None,
+        help='optional scene json override used only for diagnostics export')
+    parser.add_argument(
+        '--diagnostics-offline-meta-only',
+        action='store_true',
+        help='set data.val.offline_meta_only=True for diagnostics export')
+    parser.add_argument(
+        '--diagnostics-subset-one-per-scene',
+        action='store_true',
+        help='build and reuse a fixed subset ann_file containing one sample per scene')
+    parser.add_argument(
+        '--diagnostics-subset-path',
+        default=None,
+        help='output path for the generated one-per-scene subset pkl')
     parser.add_argument('--max-align-missing-keys', type=int, default=None, help='pass-through to validate_vlm_align.py')
     parser.add_argument('--fail-on-unexpected-keys', action='store_true', help='pass-through to validate_vlm_align.py')
     parser.add_argument('--stop-on-val-fail', action='store_true', help='stop training immediately if any epoch validation fails')
@@ -81,7 +114,90 @@ def save_summary(summary_path: Path, records):
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 
+def ensure_one_per_scene_subset(source_ann: Path, subset_ann: Path):
+    subset_ann.parent.mkdir(parents=True, exist_ok=True)
+    if subset_ann.exists():
+        return subset_ann
+
+    with source_ann.open('rb') as f:
+        data = pickle.load(f)
+
+    if isinstance(data, dict) and 'infos' in data:
+        infos = data['infos']
+        metadata = data.get('metadata', {})
+    elif isinstance(data, list):
+        infos = data
+        metadata = {}
+    else:
+        raise ValueError('Unsupported ann_file structure for subset generation: {}'.format(type(data).__name__))
+
+    seen = set()
+    subset_infos = []
+    for info in infos:
+        scene_token = info.get('scene_token', None)
+        if scene_token is None or scene_token in seen:
+            continue
+        seen.add(scene_token)
+        subset_infos.append(info)
+
+    subset_data = {'infos': subset_infos, 'metadata': metadata}
+    with subset_ann.open('wb') as f:
+        pickle.dump(subset_data, f)
+
+    print(
+        'Saved diagnostics subset: {} (samples={}, unique_scenes={})'.format(
+            subset_ann,
+            len(subset_infos),
+            len(seen),
+        )
+    )
+    return subset_ann
+
+
+def resolve_diagnostics_ann_file(args, cfg, work_dir: Path):
+    ann_file = args.diagnostics_ann_file
+    if ann_file is None:
+        ann_file = cfg.data.val.get('ann_file', None)
+    if ann_file is None:
+        raise ValueError('diagnostics ann_file is required: use --diagnostics-ann-file or set data.val.ann_file in config.')
+
+    ann_path = Path(ann_file)
+    if args.diagnostics_subset_one_per_scene:
+        subset_path = args.diagnostics_subset_path
+        if subset_path is None:
+            subset_path = work_dir / 'tmp_val_one_per_scene.pkl'
+        subset_path = Path(subset_path)
+        return ensure_one_per_scene_subset(ann_path, subset_path)
+
+    return ann_path
+
+
+def build_validate_cfg_overrides(args, cfg, diagnostics_ann_file=None):
+    overrides = []
+    train_extra = list(getattr(args, 'train_extra', []) or [])
+    offline_train_mode = any(x.startswith('model.run_mode=offline_train') for x in train_extra)
+    if offline_train_mode:
+        overrides.extend([
+            'model.run_mode=offline_infer_validate',
+            'model.offline_split=val',
+        ])
+        if args.diagnostics_offline_meta_only or args.dump_embedding_diagnostics:
+            overrides.append('data.val.offline_meta_only=True')
+
+    scene_json_override = args.diagnostics_scene_json
+    if scene_json_override is None:
+        scene_json_override = next((x.split('=', 1)[1] for x in train_extra if x.startswith('model.scene_json=')), None)
+    if scene_json_override is not None:
+        overrides.append('model.scene_json={}'.format(scene_json_override))
+
+    if diagnostics_ann_file is not None:
+        overrides.append('data.val.ann_file={}'.format(diagnostics_ann_file))
+
+    return overrides
+
+
 def run_validate(args, config_path, base_ckpt, align_ckpt, work_dir: Path):
+    epoch = extract_epoch_from_name(align_ckpt)
     cmd = [
         sys.executable,
         'tools/validate_vlm_align.py',
@@ -96,18 +212,15 @@ def run_validate(args, config_path, base_ckpt, align_ckpt, work_dir: Path):
         str(args.workers_per_gpu),
     ]
 
-    train_extra = list(getattr(args, 'train_extra', []) or [])
-    offline_train_mode = any(x.startswith('model.run_mode=offline_train') for x in train_extra)
-    if offline_train_mode:
-        cmd.extend([
-            '--cfg-options',
-            'model.run_mode=offline_infer_validate',
-            'model.offline_split=val',
-            'data.val.offline_meta_only=True',
-        ])
-        scene_json_override = next((x for x in train_extra if x.startswith('model.scene_json=')), None)
-        if scene_json_override is not None:
-            cmd.append(scene_json_override)
+    diagnostics_ann_file = None
+    if args.dump_embedding_diagnostics and (args.diagnostics_ann_file or args.diagnostics_subset_one_per_scene):
+        cfg = Config.fromfile(config_path)
+        diagnostics_ann_file = resolve_diagnostics_ann_file(args, cfg, work_dir)
+
+    cfg_overrides = build_validate_cfg_overrides(args, Config.fromfile(config_path), diagnostics_ann_file)
+    if cfg_overrides:
+        cmd.append('--cfg-options')
+        cmd.extend(cfg_overrides)
 
     if args.max_align_missing_keys is not None:
         cmd.extend(['--max-align-missing-keys', str(args.max_align_missing_keys)])
@@ -118,6 +231,14 @@ def run_validate(args, config_path, base_ckpt, align_ckpt, work_dir: Path):
     load_report_dir.mkdir(parents=True, exist_ok=True)
     load_report_path = load_report_dir / (align_ckpt.stem + '.json')
     cmd.extend(['--load-report', str(load_report_path)])
+
+    diagnostics_path = None
+    if args.dump_embedding_diagnostics:
+        diagnostics_dir = work_dir / args.embedding_diagnostics_dir
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        diagnostics_name = args.embedding_diagnostics_name_template.format(epoch=epoch)
+        diagnostics_path = diagnostics_dir / diagnostics_name
+        cmd.extend(['--dump-embedding-diagnostics', str(diagnostics_path)])
 
     env = os.environ.copy()
     if args.val_cuda_visible_devices is not None:
@@ -130,6 +251,7 @@ def run_validate(args, config_path, base_ckpt, align_ckpt, work_dir: Path):
         'epoch': extract_epoch_from_name(align_ckpt),
         'align_ckpt': str(align_ckpt),
         'load_report': str(load_report_path),
+        'embedding_diagnostics': str(diagnostics_path) if diagnostics_path is not None else None,
         'returncode': proc.returncode,
         'val_loss_align': val_loss_align,
         'i2t_top1': i2t,

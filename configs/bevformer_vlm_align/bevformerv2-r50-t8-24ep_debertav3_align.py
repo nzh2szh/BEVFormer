@@ -45,11 +45,20 @@ model = dict(
     temporal_ffn_dims=2048,
     spatial_bev_h=200,
     spatial_bev_w=200,
+    # Multi-cluster visual pooling to reduce single-vector temporal collapse.
+    vision_pooling='netvlad',
+    vision_netvlad_clusters=8,
+    use_vision_projector=False,
+    vision_projector_residual_weight=0.1,
+    use_text_projector=False,
+    # Reduce vision-side hubness without changing inference-time feature path.
+    vision_batch_centering_weight=0.05,
+    vision_covariance_reg_weight=0.04,
     gather_ddp=True,
     use_feature_queue=True,
     use_multi_positive=True,
-    feature_queue_size=32,
-    feature_queue_warmup_steps=1000,
+    feature_queue_size=128,
+    feature_queue_warmup_steps=50,
     queue_use_scene_mask=True,
     # Enable BF16 runtime for frozen backbones and alignment head.
     use_bf16_amp=True,
@@ -87,12 +96,12 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=5e-5,
+    lr=1e-5,
     weight_decay=0.01,
 )
 optimizer_config = dict(
     type='GradientCumulativeOptimizerHook',
-    cumulative_iters=4,   # 梯度累加步数
+    cumulative_iters=1,   # 梯度累加步数
     grad_clip=dict(max_norm=1.0, norm_type=2),
 )
 
@@ -100,9 +109,9 @@ lr_config = dict(
     _delete_=True,
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=50,
-    warmup_ratio=1.0 / 10,
-    min_lr_ratio=1e-4,
+    warmup_iters=20,
+    warmup_ratio=0.2,
+    min_lr_ratio=0.1,
 )
 
 total_epochs = 20

@@ -6,6 +6,7 @@
 import random
 import warnings
 
+import mmcv
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -25,6 +26,21 @@ import os.path as osp
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from projects.mmdet3d_plugin.core.evaluation.eval_hooks import CustomDistEvalHook
 from projects.mmdet3d_plugin.datasets import custom_build_dataset
+
+
+def _apply_explicit_optimizer_lr_override(optimizer, target_lr, logger):
+    if target_lr is None:
+        return
+
+    target_lr = float(target_lr)
+    for group in optimizer.param_groups:
+        group['lr'] = target_lr
+        if 'initial_lr' in group:
+            group['initial_lr'] = target_lr
+
+    logger.info('Applied explicit optimizer lr override after resume: lr=%s', target_lr)
+
+
 def custom_train_detector(model,
                    dataset,
                    cfg,
@@ -192,8 +208,45 @@ def custom_train_detector(model,
             hook = build_from_cfg(hook_cfg, HOOKS)
             runner.register_hook(hook, priority=priority)
 
+    explicit_resume_lr = cfg.get('serial_resume_optimizer_lr', None)
+
     if cfg.resume_from:
-        runner.resume(cfg.resume_from)
+        try:
+            runner.resume(cfg.resume_from)
+            _apply_explicit_optimizer_lr_override(runner.optimizer, explicit_resume_lr, logger)
+        except ValueError as exc:
+            error_msg = str(exc)
+            if 'different number of parameter groups' not in error_msg:
+                raise
+            logger.warning(
+                'Resume optimizer state failed for %s due to parameter-group mismatch. '
+                'This usually means trainable structure changed between checkpoints. '
+                'Falling back to model-only checkpoint load without optimizer resume.',
+                cfg.resume_from,
+            )
+            checkpoint = runner.load_checkpoint(cfg.resume_from)
+            runner._epoch = checkpoint['meta']['epoch']
+            runner._iter = checkpoint['meta']['iter']
+            if runner.meta is None:
+                runner.meta = {}
+            runner.meta.setdefault('hook_msgs', {})
+            runner.meta['hook_msgs'].update(checkpoint['meta'].get('hook_msgs', {}))
+
+            if 'config' in checkpoint['meta']:
+                config = mmcv.Config.fromstring(
+                    checkpoint['meta']['config'], file_format='.py')
+                previous_gpu_ids = config.get('gpu_ids', None)
+                if previous_gpu_ids and len(previous_gpu_ids) > 0 and len(previous_gpu_ids) != runner.world_size:
+                    runner._iter = int(runner._iter * len(previous_gpu_ids) / runner.world_size)
+                    logger.info('the iteration number is changed due to change of GPU number')
+
+            runner.meta = checkpoint['meta']
+            logger.info(
+                'resumed epoch %d, iter %d without optimizer state',
+                runner.epoch,
+                runner.iter,
+            )
+            _apply_explicit_optimizer_lr_override(runner.optimizer, explicit_resume_lr, logger)
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)

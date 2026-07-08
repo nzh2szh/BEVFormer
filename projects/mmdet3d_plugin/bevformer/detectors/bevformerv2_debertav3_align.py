@@ -62,6 +62,13 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                  max_frames=40,
                  spatial_bev_h=200,
                  spatial_bev_w=200,
+                 vision_pooling='cls',
+                 vision_netvlad_clusters=8,
+                 use_vision_projector=True,
+                 vision_projector_residual_weight=1.0,
+                 use_text_projector=True,
+                 vision_batch_centering_weight=0.0,
+                 vision_covariance_reg_weight=0.0,
                  gather_ddp=True,
                  use_feature_queue=False,
                  feature_queue_size=128,
@@ -113,6 +120,27 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 embedding.
             spatial_bev_w (int): BEV width used by 2D spatial positional
                 embedding.
+            vision_pooling (str): Temporal aggregation strategy after the
+                spatial pooling. `cls` uses the temporal CLS token;
+                `frame_mean` uses the mean of encoded frame tokens;
+                `spatial_mean` uses the mean of pre-temporal frame tokens;
+                `temporal_attn` uses one learnable temporal query over encoded
+                frame tokens; `netvlad` uses multi-cluster residual pooling
+                over encoded frame tokens.
+            vision_netvlad_clusters (int): Number of NetVLAD clusters used
+                when vision_pooling='netvlad'.
+            use_vision_projector (bool): Whether to pass vision features
+                through the trainable vision projector before normalization.
+            vision_projector_residual_weight (float): Interpolation strength
+                for the vision projector path. 1.0 uses projector output
+                directly; smaller values preserve more raw vision feature.
+            use_text_projector (bool): Whether to pass frozen text features
+                through the trainable text projector before normalization.
+            vision_batch_centering_weight (float): Weight for penalizing the
+                squared norm of the gathered vision-feature batch mean. This
+                discourages hubness caused by a dominant common direction.
+            vision_covariance_reg_weight (float): Weight for off-diagonal
+                covariance regularization on gathered vision features.
             gather_ddp (bool): Whether to all-gather features across DDP
                 workers when computing contrastive loss.
             use_feature_queue (bool): Whether to use FIFO feature queues as
@@ -175,6 +203,27 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         self.scene_text_field = scene_text_field
         self.spatial_bev_h = spatial_bev_h
         self.spatial_bev_w = spatial_bev_w
+        valid_vision_pooling = {'cls', 'frame_mean', 'spatial_mean', 'temporal_attn', 'netvlad'}
+        if vision_pooling not in valid_vision_pooling:
+            raise ValueError(
+                'Unsupported vision_pooling: {}. valid values are {}.'.format(
+                    vision_pooling,
+                    sorted(valid_vision_pooling),
+                )
+            )
+        self.vision_pooling = vision_pooling
+        self.vision_netvlad_clusters = int(vision_netvlad_clusters)
+        if self.vision_netvlad_clusters <= 0:
+            raise ValueError(
+                'vision_netvlad_clusters must be > 0, got {}.'.format(
+                    self.vision_netvlad_clusters,
+                )
+            )
+        self.use_vision_projector = use_vision_projector
+        self.vision_projector_residual_weight = float(vision_projector_residual_weight)
+        self.use_text_projector = use_text_projector
+        self.vision_batch_centering_weight = float(vision_batch_centering_weight)
+        self.vision_covariance_reg_weight = float(vision_covariance_reg_weight)
         self.gather_ddp = gather_ddp
         self.use_feature_queue = use_feature_queue
         self.feature_queue_size = int(feature_queue_size)
@@ -268,6 +317,17 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         self.temporal_encoder = nn.TransformerEncoder(
             encoder_layer=encoder_layer,
             num_layers=temporal_encoder_layers)
+        self.temporal_pool_query = nn.Parameter(torch.zeros(1, 1, proj_dims))
+        self.temporal_pool = nn.MultiheadAttention(
+            embed_dim=proj_dims,
+            num_heads=temporal_num_heads,
+            dropout=dropout,
+            batch_first=True)
+        self.vision_netvlad_assign = nn.Linear(proj_dims, self.vision_netvlad_clusters)
+        self.vision_netvlad_clusters_param = nn.Parameter(
+            torch.randn(self.vision_netvlad_clusters, proj_dims) * 0.02
+        )
+        self.vision_netvlad_proj = nn.Linear(self.vision_netvlad_clusters * proj_dims, proj_dims)
 
         self.vision_projector = nn.Sequential(
             nn.Linear(proj_dims, proj_dims),
@@ -697,22 +757,27 @@ class BEVFormerDebertaAlign(BEVFormerV2):
             scene_token, frame_nbr, _ = self._get_scene_token_and_group(sample_metas)
             anchor_meta = self._get_anchor_meta(sample_metas)
             explicit_frame_nbrs = anchor_meta.get('offline_frame_nbrs', None)
+            use_explicit_frame_nbrs = isinstance(explicit_frame_nbrs, (list, tuple)) and len(explicit_frame_nbrs) > 0
             if isinstance(explicit_frame_nbrs, (list, tuple)) and len(explicit_frame_nbrs) > 0:
                 frame_numbers = [int(x) for x in explicit_frame_nbrs]
             else:
                 frame_numbers = self._select_offline_frame_numbers(scene_token, frame_nbr)
             clip_frames = []
+            missing_frame_numbers = []
             for hist_nbr in frame_numbers:
                 key = '{}::{}'.format(scene_token, hist_nbr)
                 record = self._offline_record_index.get(key)
                 if record is None:
+                    missing_frame_numbers.append(hist_nbr)
                     continue
                 filename = record.get('filename', '')
                 if not filename:
+                    missing_frame_numbers.append(hist_nbr)
                     continue
                 active_dir = self._get_active_offline_bev_dir()
                 filepath = os.path.join(active_dir, filename)
                 if not os.path.isfile(filepath):
+                    missing_frame_numbers.append(hist_nbr)
                     continue
 
                 loaded = torch.load(filepath, map_location='cpu')
@@ -736,6 +801,20 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                     )
 
                 clip_frames.append(loaded)
+
+            if use_explicit_frame_nbrs and missing_frame_numbers:
+                raise KeyError(
+                    'Explicit offline BEV chunk is incomplete for scene_token={} '
+                    'anchor_frame_nbr={}. expected {} frames, loaded {}, missing frame_nbrs={}. '
+                    'Please check {} and the offline BEV directory for this split.'.format(
+                        scene_token,
+                        frame_nbr,
+                        len(frame_numbers),
+                        len(clip_frames),
+                        missing_frame_numbers,
+                        self._offline_metadata_path(),
+                    )
+                )
 
             if len(clip_frames) == 0:
                 raise KeyError(
@@ -820,7 +899,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         bev_seq = torch.cat(batch_bev, dim=0)  # [B, T, HW, C]
         return self._uniform_temporal_length(bev_seq)
 
-    def _encode_vision(self, bev_seq):
+    def _encode_vision(self, bev_seq, return_intermediates=False):
         """Encode dense BEV tokens into one normalized global vision embedding.
 
         Args:
@@ -847,6 +926,9 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         pooled, _ = self.spatial_pool(query=query, key=tokens, value=tokens)
         pooled = pooled.squeeze(1).reshape(bsz, t, c)  # [B, T, 256]
 
+        vision_spatial_pooled = pooled.mean(dim=1)
+        vision_spatial_up = self.vision_up_proj(vision_spatial_pooled)
+
         pooled = self.vision_up_proj(pooled)  # [B, T, 768]
         cls_token = self.cls_token.expand(bsz, -1, -1)
         seq = torch.cat([cls_token, pooled], dim=1)  # [B, T+1, 768]
@@ -857,10 +939,59 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         # CLS gets dedicated PE to avoid frame index shift bugs.
         seq = seq + temporal_pe
         seq = self.temporal_encoder(seq)
-        video_feat = seq[:, 0, :]
-        # Additional projector for manifold alignment on vision side.
-        video_feat = self.vision_projector(video_feat)
-        return F.normalize(video_feat, dim=-1)
+        vision_temporal_cls = seq[:, 0, :]
+        frame_tokens = seq[:, 1:, :]
+        vision_temporal_frame_mean = frame_tokens.mean(dim=1)
+        temporal_query = self.temporal_pool_query.expand(bsz, -1, -1)
+        vision_temporal_attn, _ = self.temporal_pool(
+            query=temporal_query,
+            key=frame_tokens,
+            value=frame_tokens,
+        )
+        vision_temporal_attn = vision_temporal_attn.squeeze(1)
+        vision_netvlad = self._netvlad_pool(frame_tokens)
+        if self.vision_pooling == 'spatial_mean':
+            video_raw_feat = vision_spatial_up
+        elif self.vision_pooling == 'temporal_attn':
+            video_raw_feat = vision_temporal_attn
+        elif self.vision_pooling == 'netvlad':
+            video_raw_feat = vision_netvlad
+        elif self.vision_pooling == 'frame_mean':
+            video_raw_feat = vision_temporal_frame_mean
+        else:
+            video_raw_feat = vision_temporal_cls
+
+        vision_projector_out = self.vision_projector(video_raw_feat)
+        if self.use_vision_projector:
+            residual_weight = self.vision_projector_residual_weight
+            video_feat_pre_norm = video_raw_feat + residual_weight * (vision_projector_out - video_raw_feat)
+        else:
+            video_feat_pre_norm = video_raw_feat
+        video_feat = F.normalize(video_feat_pre_norm, dim=-1)
+        if not return_intermediates:
+            return video_feat
+        intermediates = {
+            'vision_spatial_pooled': vision_spatial_pooled,
+            'vision_spatial_up': vision_spatial_up,
+            'vision_temporal_cls': vision_temporal_cls,
+            'vision_temporal_frame_mean': vision_temporal_frame_mean,
+            'vision_temporal_attn': vision_temporal_attn,
+            'vision_netvlad': vision_netvlad,
+            'vision_pre_norm': video_feat_pre_norm,
+            'vision_projector_out': F.normalize(vision_projector_out, dim=-1),
+            'vision_final': video_feat,
+        }
+        return video_feat, intermediates
+
+    def _netvlad_pool(self, tokens):
+        """Pool temporal frame tokens with trainable multi-cluster residuals."""
+        assignments = F.softmax(self.vision_netvlad_assign(tokens), dim=-1)
+        residuals = tokens.unsqueeze(2) - self.vision_netvlad_clusters_param.view(1, 1, -1, tokens.size(-1))
+        vlad = (assignments.unsqueeze(-1) * residuals).sum(dim=1)
+        vlad = F.normalize(vlad, p=2, dim=-1)
+        vlad = vlad.reshape(tokens.size(0), -1)
+        vlad = F.normalize(vlad, p=2, dim=-1)
+        return self.vision_netvlad_proj(vlad)
 
     def _masked_mean_pooling(self, hidden_states, attention_mask):
         """Pool text tokens with attention mask to ignore [PAD] positions.
@@ -939,7 +1070,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
             text_ids = text_ids.to(device=device)
         return text_ids
 
-    def _encode_text(self, texts, device):
+    def _encode_text(self, texts, device, return_intermediates=False):
         """Encode text with frozen DeBERTa and trainable text projector.
 
         Args:
@@ -958,9 +1089,22 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         with torch.no_grad():
             outputs = self.text_encoder(**batch_tokens)
 
-        text_feat = self._masked_mean_pooling(outputs.last_hidden_state, batch_tokens['attention_mask'])
-        text_feat = self.text_projector(text_feat)
-        return F.normalize(text_feat, dim=-1)
+        text_raw_pool = self._masked_mean_pooling(outputs.last_hidden_state, batch_tokens['attention_mask'])
+        if self.use_text_projector:
+            text_projector_out = self.text_projector(text_raw_pool)
+            text_feat = text_projector_out
+        else:
+            text_projector_out = self.text_projector(text_raw_pool)
+            text_feat = text_raw_pool
+        text_feat = F.normalize(text_feat, dim=-1)
+        if not return_intermediates:
+            return text_feat
+        intermediates = {
+            'text_raw_pool': text_raw_pool,
+            'text_projector_out': F.normalize(text_projector_out, dim=-1),
+            'text_final': text_feat,
+        }
+        return text_feat, intermediates
 
     def _gather_with_grad(self, x):
         """All-gather tensors for larger in-batch negatives in DDP training.
@@ -1164,6 +1308,62 @@ class BEVFormerDebertaAlign(BEVFormerV2):
         all_lse = torch.logsumexp(logits, dim=1)
         return -(pos_lse - all_lse).mean()
 
+    def _feature_centering_loss(self, feat_mat):
+        """Penalize a dominant batch-wise mean direction in feature space."""
+        if feat_mat is None or feat_mat.numel() == 0:
+            return self.logit_scale.new_zeros(())
+        mean_feat = feat_mat.mean(dim=0)
+        return mean_feat.pow(2).sum()
+
+    def _feature_covariance_loss(self, feat_mat):
+        """Penalize feature correlation and low per-dimension variance.
+
+        The previous raw-covariance formulation was too easy to dilute after
+        averaging over all off-diagonal entries in a 768-dim space. This
+        variant first standardizes each dimension, then penalizes off-diagonal
+        correlation and collapsed per-dimension std in the style of VICReg.
+        """
+        if feat_mat is None or feat_mat.dim() != 2 or feat_mat.shape[0] <= 1:
+            return self.logit_scale.new_zeros(())
+
+        centered = feat_mat - feat_mat.mean(dim=0, keepdim=True)
+        var = centered.pow(2).mean(dim=0)
+        std = torch.sqrt(var + 1e-4)
+
+        # Prevent low-variance dimensions from silently collapsing even when
+        # raw off-diagonal covariance is numerically tiny.
+        variance_floor_loss = F.relu(1.0 - std).mean()
+
+        standardized = centered / std.unsqueeze(0)
+        corr = standardized.t().matmul(standardized) / float(feat_mat.shape[0] - 1)
+        offdiag_mask = ~torch.eye(corr.shape[0], dtype=torch.bool, device=corr.device)
+        offdiag = corr[offdiag_mask]
+        if offdiag.numel() == 0:
+            return variance_floor_loss
+        correlation_loss = offdiag.pow(2).mean()
+        return variance_floor_loss + correlation_loss
+
+    def _vision_geometry_losses(self, vision_feat, gather_ddp=False):
+        """Build auxiliary losses that spread the vision embedding geometry."""
+        if self.vision_batch_centering_weight <= 0 and self.vision_covariance_reg_weight <= 0:
+            return {}
+
+        if gather_ddp:
+            feat_mat = self._gather_with_grad(vision_feat)
+        else:
+            feat_mat = vision_feat
+
+        losses = {}
+        if self.vision_batch_centering_weight > 0:
+            losses['loss_vision_centering'] = (
+                self.vision_batch_centering_weight * self._feature_centering_loss(feat_mat)
+            )
+        if self.vision_covariance_reg_weight > 0:
+            losses['loss_vision_covariance'] = (
+                self.vision_covariance_reg_weight * self._feature_covariance_loss(feat_mat)
+            )
+        return losses
+
     def _contrastive_loss(self, vision_feat, text_feat, scene_ids=None, text_ids=None, gather_ddp=False, use_queue=False):
         """Compute symmetric InfoNCE loss (image->text and text->image).
 
@@ -1343,7 +1543,19 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                     'acc_t2i_top1': bev_seq.new_tensor(0.0),
                 }
 
-            vision_feat = self._encode_vision(bev_seq)
+            return_intermediates = bool(getattr(self, 'return_intermediate_feats', False))
+            need_vision_geometry_feat = (
+                self.vision_batch_centering_weight > 0
+                or self.vision_covariance_reg_weight > 0
+            )
+            if return_intermediates or need_vision_geometry_feat:
+                vision_feat, vision_intermediates = self._encode_vision(
+                    bev_seq,
+                    return_intermediates=True,
+                )
+            else:
+                vision_feat = self._encode_vision(bev_seq)
+                vision_intermediates = None
             scene_tokens = self._resolve_scene_tokens(img_metas)
             scene_ids = self._resolve_scene_ids(scene_tokens=scene_tokens, device=device)
             texts = self._resolve_scene_text(
@@ -1352,7 +1564,15 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 scene_tokens=scene_tokens,
             )
             text_ids = self._resolve_text_ids(texts, device=device)
-            text_feat = self._encode_text(texts, device=device)
+            if return_intermediates:
+                text_feat, text_intermediates = self._encode_text(
+                    texts,
+                    device=device,
+                    return_intermediates=True,
+                )
+            else:
+                text_feat = self._encode_text(texts, device=device)
+                text_intermediates = None
 
             # Queue entries collected during warmup can be very stale when
             # warmup is long (e.g. trainval). Reset once at the transition
@@ -1378,6 +1598,13 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 gather_ddp=self.gather_ddp,
                 use_queue=self.use_feature_queue,
             )
+            vision_geometry_feat = vision_feat
+            if vision_intermediates is not None:
+                vision_geometry_feat = vision_intermediates.get('vision_pre_norm', vision_feat)
+            aux_losses = self._vision_geometry_losses(
+                vision_geometry_feat,
+                gather_ddp=self.gather_ddp,
+            )
 
             self._enqueue_feature_queue(
                 vision_feat,
@@ -1392,6 +1619,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
             'loss_align': loss,
             'acc_i2t_top1': i2t_top1,
             'acc_t2i_top1': t2i_top1,
+            **aux_losses,
         }
 
     def forward_test(self, img_metas, img=None, scene_text=None, **kwargs):
@@ -1416,7 +1644,15 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 self._dump_bev_features(bev_seq, img_metas)
                 return [{'extract_saved': True} for _ in range(bev_seq.shape[0])]
 
-            vision_feat = self._encode_vision(bev_seq)
+            return_intermediates = bool(getattr(self, 'return_intermediate_feats', False))
+            if return_intermediates:
+                vision_feat, vision_intermediates = self._encode_vision(
+                    bev_seq,
+                    return_intermediates=True,
+                )
+            else:
+                vision_feat = self._encode_vision(bev_seq)
+                vision_intermediates = None
             scene_tokens = self._resolve_scene_tokens(img_metas)
             texts = self._resolve_scene_text(
                 img_metas,
@@ -1428,7 +1664,15 @@ class BEVFormerDebertaAlign(BEVFormerV2):
             for sample_metas in temporal_metas:
                 scene_token, _, _ = self._get_scene_token_and_group(sample_metas)
                 scene_tokens.append(scene_token)
-            text_feat = self._encode_text(texts, device=device)
+            if return_intermediates:
+                text_feat, text_intermediates = self._encode_text(
+                    texts,
+                    device=device,
+                    return_intermediates=True,
+                )
+            else:
+                text_feat = self._encode_text(texts, device=device)
+                text_intermediates = None
             loss_align, i2t_top1, t2i_top1, logits = self._contrastive_loss(
                 vision_feat,
                 text_feat,
@@ -1438,7 +1682,7 @@ class BEVFormerDebertaAlign(BEVFormerV2):
 
         results = []
         for i in range(logits.shape[0]):
-            results.append({
+            result = {
                 'i2t_top1': int(logits[i].argmax().item()),
                 'i2t_score': float(logits[i].max().item()),
                 'loss_align': float(loss_align.item()),
@@ -1450,7 +1694,15 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 'text_feat': text_feat[i].detach().cpu(),
                 'scene_token': scene_tokens[i],
                 'scene_text': texts[i],
-            })
+            }
+            if return_intermediates:
+                embedding_layers = {}
+                for name, value in vision_intermediates.items():
+                    embedding_layers[name] = value[i].detach().cpu()
+                for name, value in text_intermediates.items():
+                    embedding_layers[name] = value[i].detach().cpu()
+                result['embedding_layers'] = embedding_layers
+            results.append(result)
         return results
 
     def trainable_state_dict(self):
@@ -1471,6 +1723,11 @@ class BEVFormerDebertaAlign(BEVFormerV2):
                 or k.startswith('cls_temporal_pe')
                 or k.startswith('temporal_pe')
                 or k.startswith('temporal_encoder')
+                or k.startswith('temporal_pool_query')
+                or k.startswith('temporal_pool')
+                or k.startswith('vision_netvlad_assign')
+                or k.startswith('vision_netvlad_clusters_param')
+                or k.startswith('vision_netvlad_proj')
                 or k.startswith('vision_projector')
                 or k.startswith('text_projector')
                 or k.startswith('logit_scale')
